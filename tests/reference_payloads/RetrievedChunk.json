@@ -1,0 +1,10 @@
+{
+  "chunk_id": "chunk_001",
+  "text": "Revenue increased by 15% year-over-year driven by new product launches.",
+  "source_artifact_id": "sha256:abc123",
+  "metadata": {
+    "source_kind": "user_docs",
+    "visibility": "user"
+  },
+  "score": 0.92
+}

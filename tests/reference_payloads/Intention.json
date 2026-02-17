@@ -1,0 +1,7 @@
+{
+  "intention_id": "intent-002",
+  "objective": "Generate weekly management report",
+  "constraints": ["Use only internal data sources", "Output as PDF"],
+  "plan_id": "plan-iter1-112233",
+  "phase": "COMMIT"
+}

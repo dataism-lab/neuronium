@@ -1,0 +1,7 @@
+{
+  "node_id": "generate",
+  "node_type": "model",
+  "label": "Generate Python code from objective",
+  "parameters": {"system_prompt": "You are a Python code generator."},
+  "priority": 0
+}

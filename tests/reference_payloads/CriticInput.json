@@ -1,0 +1,15 @@
+{
+  "node_id": "critic",
+  "node_type": "model",
+  "outputs": {
+    "content": "x = 42\nprint(x)",
+    "exit_code": 0,
+    "stdout": "42\n"
+  },
+  "quality_signals": {
+    "confidence": 0.95
+  },
+  "criteria": {
+    "must_pass": true
+  }
+}

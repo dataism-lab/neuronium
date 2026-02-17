@@ -1,0 +1,16 @@
+{
+  "trace_id": "abc123def456",
+  "execution_id": "exec-001",
+  "run_state": "RUNNING",
+  "intention": {
+    "intention_id": "intent-001",
+    "objective": "Print the value of x",
+    "constraints": ["Use only stdlib"],
+    "plan_id": "plan-iter1-aabbccdd",
+    "phase": "EXECUTE"
+  },
+  "created_at": "2026-02-10T12:00:00+00:00",
+  "progress": 0.5,
+  "current_node_ref": "exec-001:plan-iter1-aabbccdd/execute/generate",
+  "message": "Executing iteration 1"
+}

@@ -1,0 +1,15 @@
+{
+  "chunk_id": "chunk_001",
+  "source_artifact_id": "sha256:abc123",
+  "source_kind": "user_docs",
+  "visibility": "user",
+  "locator": {
+    "source_uri": "docs/report.md",
+    "start_char": 100,
+    "end_char": 350
+  },
+  "quote": "Revenue increased by 15% year-over-year.",
+  "quote_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "relevance_score": 0.92,
+  "confidence": 0.88
+}

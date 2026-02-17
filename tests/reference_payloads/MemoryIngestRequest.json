@@ -1,0 +1,7 @@
+{
+  "paths": ["docs/report.md", "docs/appendix.md"],
+  "source_kind": "user_docs",
+  "visibility": "user",
+  "chunk_max_chars": 2000,
+  "chunk_overlap_chars": 200
+}

@@ -1,0 +1,6 @@
+{
+  "state": "COMPLETED",
+  "progress": 1.0,
+  "current_node_ref": null,
+  "message": "Iter1: critic PASS with evidence"
+}

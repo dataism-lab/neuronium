@@ -1,0 +1,13 @@
+{
+  "outputs": {
+    "content": "x = 42\nprint(x)"
+  },
+  "quality_signals": {
+    "confidence": 0.95,
+    "tokens_used": 15,
+    "latency_ms": 320.5,
+    "extras": {}
+  },
+  "status": "COMPLETED",
+  "error": null
+}

@@ -1,0 +1,7 @@
+{
+  "type": "replan",
+  "payload": {
+    "constraints_add": ["Fix execution error: NameError"],
+    "reason": "critic_fail"
+  }
+}

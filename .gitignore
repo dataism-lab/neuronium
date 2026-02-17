@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# Virtualenv
+.venv/
+
+# Neuronium runtime data
+.neuronium/

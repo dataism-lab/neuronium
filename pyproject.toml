@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "neuronium-agent"
+version = "0.1.0"
+description = "Commitment-aware AI Super Agent with HTN planning, DAG execution, audit/replay trace"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "Neuronium Team" }]
+keywords = ["ai", "agent", "htn", "dag", "graphrag"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Typing :: Typed",
+]
+
+dependencies = [
+    "pydantic>=2.0,<3",
+    "click>=8.0,<9",
+    "openai>=1.0,<3",
+    "python-dotenv>=1.0,<2",
+]
+
+[project.optional-dependencies]
+docker = ["docker>=7.0,<8"]
+postgres = ["psycopg[binary]>=3.1,<4"]
+redis = ["redis>=5.0,<6", "rq>=1.16,<2"]
+pgvector = ["pgvector>=0.3,<1"]
+embeddings = ["sentence-transformers>=2.0,<4", "numpy>=1.24,<3"]
+dev = [
+    "pytest>=8.0,<9",
+    "pytest-asyncio>=0.23,<1",
+    "coverage>=7.0,<8",
+]
+all = [
+    "neuronium-agent[docker,postgres,redis,pgvector,embeddings,dev]",
+]
+
+[project.scripts]
+neuronium-agent = "neuronium_agent.cli.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["neuronium_agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
