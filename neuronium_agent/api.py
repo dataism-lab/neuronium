@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
-from typing import Any
+import json
+from pathlib import Path
+from typing import Any, Callable
 
 from neuronium_agent.config import AppConfig, load_config
 from neuronium_agent.core.orchestrator import Orchestrator
@@ -36,11 +38,18 @@ class AgentRunner:
         config: AppConfig,
         blob_store: BlobStore,
         index_store: IndexStore,
+        *,
+        trace_event_listener: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._config = config
         self._blob = blob_store
         self._index = index_store
-        self._orchestrator = Orchestrator(config, blob_store, index_store)
+        self._orchestrator = Orchestrator(
+            config,
+            blob_store,
+            index_store,
+            trace_event_listener=trace_event_listener,
+        )
         self._exporter = TraceExporter()
 
     # -- Mandatory methods (PUBLIC_API_SPEC) --------------------------------
@@ -90,12 +99,63 @@ class AgentRunner:
         provider = ReplayProvider(events)
         return self._orchestrator.replay(trace_id, provider)
 
+    def get_latest_pause_context(self, trace_id: str) -> dict[str, Any] | None:
+        """Return latest paused checkpoint resume_context, if present."""
+        events = list(self._index.get_trace_events(trace_id))
+        for event in reversed(events):
+            if event.get("kind") != "checkpoint":
+                continue
+            payload = event.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
+            resume_context = payload.get("resume_context", {})
+            if not isinstance(resume_context, dict):
+                continue
+            if resume_context.get("phase_boundary") == "paused":
+                return resume_context
+        return None
+
+    def read_artifact_json(self, artifact_id: str) -> dict[str, Any]:
+        """Load artifact bytes and decode as UTF-8 JSON object."""
+        raw = self._blob.get(artifact_id)
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Artifact JSON payload must be an object")
+        return data
+
+    def get_trace_events(self, trace_id: str) -> list[dict[str, Any]]:
+        """Return all recorded trace events for *trace_id*."""
+        return list(self._index.get_trace_events(trace_id))
+
+    def get_latest_rendered_artifact_path(self, trace_id: str) -> str | None:
+        """Return latest rendered HTML path for a run, if indexed."""
+        index_path = Path(self._config.project.data_dir) / "rendered" / "index.jsonl"
+        if not index_path.exists():
+            return None
+        lines = index_path.read_text(encoding="utf-8").splitlines()
+        for line in reversed(lines):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if str(row.get("trace_id", "")) != trace_id:
+                continue
+            artifact_path = str(row.get("artifact_path", "")).strip()
+            return artifact_path or None
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
-def create_runner(config: AppConfig | None = None) -> AgentRunner:
+def create_runner(
+    config: AppConfig | None = None,
+    *,
+    trace_event_listener: Callable[[dict[str, Any]], None] | None = None,
+) -> AgentRunner:
     """Create an :class:`AgentRunner` from config (PUBLIC_API_SPEC §3.2).
 
     If *config* is ``None``, loads from the default config chain.
@@ -106,7 +166,12 @@ def create_runner(config: AppConfig | None = None) -> AgentRunner:
     blob_store = _create_blob_store(config)
     index_store = _create_index_store(config)
 
-    return AgentRunner(config, blob_store, index_store)
+    return AgentRunner(
+        config,
+        blob_store,
+        index_store,
+        trace_event_listener=trace_event_listener,
+    )
 
 
 # ---------------------------------------------------------------------------

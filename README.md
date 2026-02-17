@@ -123,7 +123,7 @@ neuronium_agent/
 │   └── migrations/     # SQL миграции (sqlite/, postgres/)
 ├── trace/              # Recorder, exporter, replay
 ├── verification/       # Simulated critics
-├── memory/             # GraphRAG (stub v1)
+├── memory/             # GraphRAG-lite (chunks + provenance, v0.2)
 ├── control/            # Control protocol
 ├── queue/              # Redis + RQ runner
 └── cli/                # CLI entrypoints
@@ -175,8 +175,16 @@ pytest tests/ -v
 
 ## Документация
 
-- **Implementation Binding**: `Implementation_Binding_Spec.md`
-- **Roadmap**: `ROADMAP.md`
-- **Config**: `CONFIG_SPEC.md`
-- **Public API**: `PUBLIC_API_SPEC.md`
-- **Storage schema**: `STORAGE_SCHEMA_SPEC.md`
+- **Docs index**: `docs/README.md`
+- **Demo walkthrough (RU)**: `docs/demos/DEMO_WALKTHROUGH_RU.md`
+- **Conference demo script (RU)**: `docs/demos/CONFERENCE_DEMO_SCRIPT_RU.md`
+- **Management status report (RU)**: `docs/reports/STATUS_REPORT_FOR_MANAGEMENT_RU.md`
+- **Technical overview (RU)**: `docs/overview/PROJECT_TECH_OVERVIEW_RU.md`
+- **Implementation Binding**: `docs/architecture/Implementation_Binding_Spec.md`
+- **Roadmap**: `docs/roadmap/ROADMAP.md`
+- **Roadmap status**: `docs/roadmap/ROADMAP_STATUS.md`
+- **Config**: `docs/architecture/CONFIG_SPEC.md`
+- **Public API**: `docs/architecture/PUBLIC_API_SPEC.md`
+- **Storage schema**: `docs/architecture/STORAGE_SCHEMA_SPEC.md`
+- **Presentation**: `docs/architecture/Super_Agent_presentation.md`
+- **Full architecture spec**: `docs/architecture/AI_Super_Agent_Architecture_Implementation_Specification.md`

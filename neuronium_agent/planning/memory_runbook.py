@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pathlib import Path
+
 from neuronium_agent.planning.dag import (
     ActionGraph,
     GraphEdge,
@@ -37,12 +39,32 @@ from neuronium_agent.verification.memory_critic import (
 # ---------------------------------------------------------------------------
 
 _DEFAULT_INTERNAL_DOC_PATHS: list[str] = [
-    "Super_Agent_presentation.md",
-    "ROADMAP.md",
-    "ROADMAP_STATUS.md",
-    "Implementation_Binding_Spec.md",
-    "STORAGE_SCHEMA_SPEC.md",
+    # Preferred new locations (docs/ structure).
+    "docs/architecture/Super_Agent_presentation.md",
+    "docs/roadmap/ROADMAP.md",
+    "docs/roadmap/ROADMAP_STATUS.md",
+    "docs/architecture/Implementation_Binding_Spec.md",
+    "docs/architecture/STORAGE_SCHEMA_SPEC.md",
 ]
+
+
+def _prefer_existing_paths(paths: list[str]) -> list[str]:
+    """Best-effort resolve doc paths across repo reorganisations.
+
+    Missing files are tolerated by ``memory.ingest_files`` (warnings), but we
+    still try to point to the most likely existing locations.
+    """
+    resolved: list[str] = []
+    for p in paths:
+        if Path(p).exists():
+            resolved.append(p)
+            continue
+        legacy = Path(p).name
+        if Path(legacy).exists():
+            resolved.append(legacy)
+        else:
+            resolved.append(p)
+    return resolved
 
 _MEMORY_DRAFT_SYSTEM_PROMPT = (
     "You are an operations analyst.\n"
@@ -235,9 +257,9 @@ class HybridMemoryReportV1Runbook(Runbook):
         metadata: dict[str, Any],
         execution_id: str,
     ) -> list[ActionGraphStage]:
-        internal_doc_paths: list[str] = list(
+        internal_doc_paths: list[str] = _prefer_existing_paths(list(
             metadata.get("internal_doc_paths") or _DEFAULT_INTERNAL_DOC_PATHS
-        )
+        ))
         user_doc_paths: list[str] = list(
             metadata.get("user_doc_paths") or []
         )

@@ -8,6 +8,7 @@ deterministic order (tie-breaker: priority, then node_id).
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -182,7 +183,10 @@ class DAGExecutor:
             # Critic nodes have a json_schema parameter — build a structured
             # evaluation prompt from all available inputs.
             if graph_node.parameters.get("json_schema"):
-                inputs["prompt"] = _build_critic_prompt(inputs)
+                inputs["prompt"] = _build_critic_prompt(
+                    inputs,
+                    parameters=graph_node.parameters,
+                )
             elif inputs.get("previous_code"):
                 # Fix node — build prompt with error context
                 inputs["prompt"] = _build_fix_prompt(inputs)
@@ -213,26 +217,30 @@ class DAGExecutor:
         )
 
         # Emit node_start
+        started = time.perf_counter()
         self._emit("node_start", {
             "node_id": node_id,
             "node_ref": node_ref,
             "node_type": graph_node.node_type if graph_node else "unknown",
             "inputs": inputs,
+            "parameters": graph_node.parameters if graph_node else {},
         })
 
-        now = datetime.now(timezone.utc).isoformat()
         try:
             output = node_impl.execute(node_input)
         except Exception as exc:
             output = NodeOutput(status="FAILED", error=str(exc))
 
         # Emit node_end
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
         self._emit("node_end", {
             "node_id": node_id,
             "node_ref": node_ref,
             "status": output.status,
             "outputs": output.outputs,
             "error": output.error,
+            "quality_signals": output.quality_signals.model_dump(mode="json"),
+            "elapsed_ms": elapsed_ms,
         })
 
         return output
@@ -246,7 +254,11 @@ class DAGExecutor:
 # Module-level helpers
 # ---------------------------------------------------------------------------
 
-def _build_critic_prompt(inputs: dict[str, Any]) -> str:
+def _build_critic_prompt(
+    inputs: dict[str, Any],
+    *,
+    parameters: dict[str, Any] | None = None,
+) -> str:
     """Build a structured evaluation prompt for the LLM critic node.
 
     Aggregates objective, code, and execution results from predecessor
@@ -279,6 +291,37 @@ def _build_critic_prompt(inputs: dict[str, Any]) -> str:
         if isinstance(constraints, list):
             constraints = "\n".join(constraints)
         parts.append(f"CONSTRAINTS:\n{constraints}")
+
+    context_kind = ""
+    if parameters and isinstance(parameters.get("context_kind"), str):
+        context_kind = str(parameters["context_kind"])
+    if context_kind:
+        parts.append(f"CONTEXT_KIND: {context_kind}")
+
+    # Include upstream context so critic can be objective-aware for docs/web modes.
+    excluded = {
+        "objective",
+        "constraints",
+        "content",
+        "previous_code",
+        "exit_code",
+        "previous_exit_code",
+        "stdout",
+        "previous_stdout",
+        "stderr",
+        "previous_stderr",
+        "prompt",
+        "tool_name",
+        "tool_args",
+    }
+    context_keys = sorted(k for k in inputs if k not in excluded)
+    if context_keys:
+        parts.append("SOURCE CONTEXT:")
+        for key in context_keys:
+            if key == "html":
+                # Keep critic prompt compact and deterministic.
+                continue
+            parts.append(f"{key}:\n{_format_context_value(inputs.get(key), max_len=2000)}")
 
     return "\n\n".join(parts) if parts else "Evaluate the execution result."
 

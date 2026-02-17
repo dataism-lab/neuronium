@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from neuronium_agent.planning.dag import ActionGraph
+from neuronium_agent.planning.planner_contract import DynamicPlannerSpec
 
 
 # ---------------------------------------------------------------------------
@@ -68,12 +69,16 @@ class ActionGraphStage:
         DAG executor (merged with objective/constraints).
     success_gate:
         Declarative gate checked after execution.
+    dynamic_planner:
+        Optional dynamic planner configuration. If provided, COMMIT runs a
+        planner ModelNode that returns the stage graph at runtime.
     """
 
     stage_id: str
     graph: ActionGraph
     initial_inputs_override: dict[str, Any] = field(default_factory=dict)
     success_gate: StageSuccessGate = field(default_factory=StageSuccessGate)
+    dynamic_planner: DynamicPlannerSpec | None = None
 
 
 # ---------------------------------------------------------------------------

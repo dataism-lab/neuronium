@@ -89,14 +89,30 @@ class ModelNode(BaseNode):
                     status="FAILED",
                     error="Replay exhausted: no more recorded responses",
                 )
+            logger.info(
+                "llm_call_start node_id=%s replay=true",
+                self.node_id,
+            )
             resp = self._replay_responses[self._replay_index]
             self._replay_index += 1
+            status = str(resp.get("status", "COMPLETED"))
+            outputs = resp.get("outputs", {})
+            quality_signals = resp.get("quality_signals", {})
+            if self._recorded_responses is not None:
+                self._recorded_responses.append({
+                    "outputs": outputs,
+                    "quality_signals": quality_signals,
+                    "status": status,
+                })
+            logger.info(
+                "llm_call_end node_id=%s replay=true status=%s",
+                self.node_id,
+                status,
+            )
             return NodeOutput(
-                outputs=resp.get("outputs", {}),
-                quality_signals=QualitySignals(
-                    **resp.get("quality_signals", {})
-                ),
-                status="COMPLETED",
+                outputs=outputs,
+                quality_signals=QualitySignals(**quality_signals),
+                status=status,
             )
 
         # Live LLM call -------------------------------------------------------
@@ -138,9 +154,28 @@ class ModelNode(BaseNode):
                 },
             }
 
+        logger.info(
+            "llm_call_start node_id=%s model=%s structured=%s prompt_chars=%d",
+            self.node_id,
+            self.model,
+            bool(self.structured_output and json_schema),
+            len(str(prompt)),
+        )
         try:
             completion = client.chat.completions.create(**kwargs)
         except Exception as exc:
+            logger.warning(
+                "llm_call_end node_id=%s status=FAILED error=%s",
+                self.node_id,
+                str(exc),
+            )
+            if self._recorded_responses is not None:
+                self._recorded_responses.append({
+                    "outputs": {},
+                    "quality_signals": QualitySignals().model_dump(mode="json"),
+                    "status": "FAILED",
+                    "error": str(exc),
+                })
             return NodeOutput(status="FAILED", error=str(exc))
 
         choice = completion.choices[0]
@@ -168,6 +203,12 @@ class ModelNode(BaseNode):
         if self._recorded_responses is not None:
             self._recorded_responses.append(record)
 
+        logger.info(
+            "llm_call_end node_id=%s status=COMPLETED tokens=%s content_chars=%d",
+            self.node_id,
+            quality.tokens_used,
+            len(content),
+        )
         return NodeOutput(
             outputs=outputs,
             quality_signals=quality,

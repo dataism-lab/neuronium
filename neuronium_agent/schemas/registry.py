@@ -41,6 +41,11 @@ from neuronium_agent.memory.models import (
     MemoryResult,
     RetrievedChunk,
 )
+from neuronium_agent.planning.extraction_contract import (
+    ClarificationRequest,
+    ClarificationResponse,
+    ExtractionEnvelope,
+)
 
 # -- Verification ------------------------------------------------------------
 from neuronium_agent.verification.critic import (
@@ -98,6 +103,10 @@ SCHEMA_REGISTRY: dict[str, Type[BaseModel]] = {
     "ControlCommand": ControlCommand,
     "NodeStatus": NodeStatus,
     "FailureClass": FailureClass,
+    # Supervised extraction / clarification
+    "ExtractionEnvelope": ExtractionEnvelope,
+    "ClarificationRequest": ClarificationRequest,
+    "ClarificationResponse": ClarificationResponse,
 }
 """Stable mapping of schema name → Pydantic model.
 

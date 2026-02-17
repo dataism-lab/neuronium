@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from pathlib import Path
+
 from neuronium_agent.planning.dag import (
     ActionGraph,
     GraphEdge,
@@ -142,12 +144,33 @@ def plan_docs_report_v1(
 # ---------------------------------------------------------------------------
 
 _DEFAULT_DOC_PATHS = [
-    "Super_Agent_presentation.md",
-    "ROADMAP.md",
-    "ROADMAP_STATUS.md",
-    "Implementation_Binding_Spec.md",
-    "STORAGE_SCHEMA_SPEC.md",
+    # Preferred new locations (docs/ structure).
+    "docs/architecture/Super_Agent_presentation.md",
+    "docs/roadmap/ROADMAP.md",
+    "docs/roadmap/ROADMAP_STATUS.md",
+    "docs/architecture/Implementation_Binding_Spec.md",
+    "docs/architecture/STORAGE_SCHEMA_SPEC.md",
 ]
+
+
+def _prefer_existing_paths(paths: list[str]) -> list[str]:
+    """Best-effort resolve doc paths across repo reorganisations.
+
+    If a preferred docs/* path does not exist yet, fall back to the basename
+    in the repository root (legacy layout).
+    """
+    resolved: list[str] = []
+    for p in paths:
+        if Path(p).exists():
+            resolved.append(p)
+            continue
+        legacy = Path(p).name
+        if Path(legacy).exists():
+            resolved.append(legacy)
+        else:
+            # Keep original (will fail loudly if executed).
+            resolved.append(p)
+    return resolved
 
 
 class DocsReportV1Runbook(Runbook):
@@ -171,7 +194,7 @@ class DocsReportV1Runbook(Runbook):
     ) -> list[ActionGraphStage]:
         doc_paths: list[str] = metadata.get("doc_paths") or []  # type: ignore[assignment]
         if not isinstance(doc_paths, list) or not doc_paths:
-            doc_paths = list(_DEFAULT_DOC_PATHS)
+            doc_paths = _prefer_existing_paths(list(_DEFAULT_DOC_PATHS))
 
         plan_id = f"plan-docs-report-v1-{execution_id[:12]}"
 

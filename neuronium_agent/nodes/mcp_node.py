@@ -9,6 +9,7 @@ v0.2: local transport (in-process) via ``neuronium_agent.tools.local_tools``.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from neuronium_agent.errors import McpError
@@ -75,10 +76,31 @@ class McpToolNode(BaseNode):
             node_input.parameters.get("tool_name")
             or node_input.inputs.get("tool_name", "")
         )
-        tool_args = (
-            node_input.parameters.get("tool_args")
-            or node_input.inputs.get("tool_args", {})
+        static_tool_args = node_input.parameters.get("tool_args")
+        if not isinstance(static_tool_args, dict):
+            static_tool_args = {}
+        dynamic_tool_args = node_input.inputs.get("tool_args", {})
+        if not isinstance(dynamic_tool_args, dict):
+            dynamic_tool_args = {}
+
+        # Data-flow by default: predecessor outputs become candidate tool args.
+        # Explicit tool_args keep priority over auto-wired inputs.
+        auto_tool_args = {
+            k: v
+            for k, v in node_input.inputs.items()
+            if k not in {"tool_name", "tool_args"}
+        }
+        tool_args: dict[str, Any] = {}
+        tool_args.update(auto_tool_args)
+        tool_args.update(dynamic_tool_args)
+        tool_args.update(static_tool_args)
+        logger.info(
+            "tool_call_start node_id=%s tool=%s input_keys=%s",
+            self.node_id,
+            str(tool_name),
+            sorted(tool_args.keys()),
         )
+        started = time.perf_counter()
 
         # Replay path
         if self._replay_responses is not None:
@@ -89,13 +111,28 @@ class McpToolNode(BaseNode):
                 )
             resp = self._replay_responses[self._replay_index]
             self._replay_index += 1
-            return NodeOutput(
+            result = NodeOutput(
                 outputs=resp.get("outputs", {}),
                 quality_signals=QualitySignals(
                     **resp.get("quality_signals", {})
                 ),
                 status=resp.get("status", "COMPLETED"),
             )
+            if self._recorded_responses is not None:
+                self._recorded_responses.append({
+                    "outputs": result.outputs,
+                    "quality_signals": result.quality_signals.model_dump(mode="json"),
+                    "status": result.status,
+                })
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            logger.info(
+                "tool_call_end node_id=%s tool=%s replay=true status=%s elapsed_ms=%d",
+                self.node_id,
+                str(tool_name),
+                result.status,
+                elapsed_ms,
+            )
+            return result
 
         # Policy gate check (v0.2: local allowlist; approvals not interactive yet)
         require_approval = self.policy.get("require_approval_for", [])
@@ -128,5 +165,24 @@ class McpToolNode(BaseNode):
                 "quality_signals": result.quality_signals.model_dump(mode="json"),
                 "status": result.status,
             })
+
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        extra: list[str] = []
+        if isinstance(result.outputs.get("path"), str) and result.outputs.get("path", "").strip():
+            extra.append(f"path={result.outputs['path']}")
+        if result.outputs.get("bytes_written") is not None:
+            extra.append(f"bytes={result.outputs.get('bytes_written')}")
+        if result.outputs.get("status_code") is not None:
+            extra.append(f"http={result.outputs.get('status_code')}")
+        if isinstance(result.error, str) and result.error.strip():
+            extra.append(f"error={result.error}")
+        logger.info(
+            "tool_call_end node_id=%s tool=%s status=%s elapsed_ms=%d %s",
+            self.node_id,
+            str(tool_name),
+            result.status,
+            elapsed_ms,
+            " ".join(extra).strip(),
+        )
 
         return result

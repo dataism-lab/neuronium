@@ -8,7 +8,6 @@ deterministic to support strict replay and easy codegen.
 from __future__ import annotations
 
 import glob
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -86,6 +85,43 @@ def invoke_local_tool(
             )
         raise ToolExecutionError(f"Unknown memory tool: {tool_name}")
 
+    # -- Web tools -----------------------------------------------------------
+    if tool_name.startswith("web."):
+        from neuronium_agent.tools.web_tools import (
+            invoke_web_extract_article,
+            invoke_web_fetch_html,
+        )
+
+        if tool_name == "web.fetch_html":
+            return invoke_web_fetch_html(args, policy=policy, runtime=runtime)
+        if tool_name == "web.extract_article":
+            return invoke_web_extract_article(args, policy=policy, runtime=runtime)
+        raise ToolExecutionError(f"Unknown web tool: {tool_name}")
+
+    # -- Text tools ----------------------------------------------------------
+    if tool_name.startswith("text."):
+        from neuronium_agent.tools.text_tools import invoke_text_extract_entities
+
+        if tool_name == "text.extract_entities":
+            return invoke_text_extract_entities(args, policy=policy, runtime=runtime)
+        raise ToolExecutionError(f"Unknown text tool: {tool_name}")
+
+    # -- Artifact tools ------------------------------------------------------
+    if tool_name.startswith("artifact."):
+        from neuronium_agent.tools.artifact_tools import invoke_artifact_put_json
+
+        if tool_name == "artifact.put_json":
+            return invoke_artifact_put_json(args, policy=policy, runtime=runtime)
+        raise ToolExecutionError(f"Unknown artifact tool: {tool_name}")
+
+    # -- Export tools --------------------------------------------------------
+    if tool_name.startswith("export."):
+        from neuronium_agent.tools.export_tools import invoke_export_write_text
+
+        if tool_name == "export.write_text":
+            return invoke_export_write_text(args, policy=policy, runtime=runtime)
+        raise ToolExecutionError(f"Unknown export tool: {tool_name}")
+
     if tool_name == "fs.read_text":
         raw_path = str(args.get("path", ""))
         if not raw_path:
@@ -112,6 +148,36 @@ def invoke_local_tool(
                 f"{out_key}__path": str(p),
             }
         return {"text": text, "path": str(p)}
+
+    if tool_name == "fs.write_text":
+        raw_path = str(args.get("path", ""))
+        if not raw_path:
+            raise ToolExecutionError("fs.write_text: missing 'path'")
+        text = args.get("text")
+        if not isinstance(text, str):
+            raise ToolExecutionError("fs.write_text: missing or invalid 'text'")
+        encoding = str(args.get("encoding", "utf-8"))
+        overwrite = bool(args.get("overwrite", True))
+
+        p = _normalize_path(raw_path)
+        roots_allowlist = list(policy.get("fs_roots_allowlist", []))
+        _ensure_allowed_path(p, roots_allowlist=roots_allowlist)
+
+        data = text.encode(encoding, errors="replace")
+        max_write_bytes = int(policy.get("fs_max_write_bytes", 1_000_000))
+        if len(data) > max_write_bytes:
+            raise ToolExecutionError(
+                f"fs.write_text: payload too large ({len(data)} bytes > {max_write_bytes})"
+            )
+
+        if p.exists() and not overwrite:
+            raise ToolExecutionError(
+                f"fs.write_text: target exists and overwrite is false: {str(p)}"
+            )
+
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(data)
+        return {"path": str(p), "bytes_written": len(data)}
 
     if tool_name == "fs.list_dir":
         raw_path = str(args.get("path", ""))

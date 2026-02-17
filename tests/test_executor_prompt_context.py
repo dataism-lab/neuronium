@@ -42,3 +42,35 @@ def test_model_prompt_includes_objective_and_upstream_context() -> None:
     assert "doc_000" in prompt
     assert "HELLO" in prompt
 
+
+def test_critic_prompt_includes_source_context_for_web_like_inputs() -> None:
+    graph = ActionGraph(
+        metadata=GraphMetadata(plan_id="p2", description="critic context"),
+        nodes=[
+            GraphNode(node_id="src", node_type="aggregate", label="src", priority=0),
+            GraphNode(
+                node_id="critic",
+                node_type="model",
+                label="critic",
+                priority=1,
+                parameters={"json_schema": {"type": "object"}, "context_kind": "web"},
+            ),
+        ],
+        edges=[GraphEdge(source="src", target="critic", edge_type="data")],
+    )
+    registry = {
+        "src": StaticOutputsNode(
+            "src",
+            outputs={"title_guess": "Arxiv title", "text": "Article text", "final_url": "https://arxiv.org/x"},
+        ),
+        "critic": EchoPromptNode("critic"),
+    }
+    ex = DAGExecutor(registry, execution_id="e2", trace_id="t2", random_seed=0)
+
+    results = ex.execute(graph, initial_inputs={"objective": "Summarize this article"})
+    prompt = results["critic"].outputs["prompt"]
+    assert "CONTEXT_KIND: web" in prompt
+    assert "title_guess" in prompt
+    assert "Arxiv title" in prompt
+    assert "final_url" in prompt
+

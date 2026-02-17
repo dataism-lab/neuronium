@@ -9,7 +9,7 @@ from __future__ import annotations
 import threading
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from neuronium_agent._canonical import canonical_json
 from neuronium_agent.storage.index_store import IndexStore
@@ -25,11 +25,14 @@ class TraceRecorder:
         self,
         trace_id: str,
         index_store: IndexStore,
+        *,
+        event_listener: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.trace_id = trace_id
         self._store = index_store
         self._events: list[dict[str, Any]] = []
         self._lock = threading.Lock()
+        self._listener = event_listener
 
     # ------------------------------------------------------------------
     # Recording
@@ -55,6 +58,12 @@ class TraceRecorder:
             }
             self._events.append(event)
             self._store.append_trace_event(self.trace_id, event)
+            if self._listener is not None:
+                try:
+                    self._listener(event)
+                except Exception:
+                    # Listener is best-effort; never break core execution.
+                    pass
             return event
 
     def record_node_start(

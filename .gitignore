@@ -10,6 +10,8 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+uv.lock
+
 # Virtualenv
 .venv/
 
@@ -17,3 +19,7 @@ __pycache__/
 .neuronium/
 
 .cursor/
+.serena/
+
+out.jsonl
+trace.jsonl

@@ -32,6 +32,7 @@ class ReplayProvider:
         self._replay_data: dict[str, list[dict[str, Any]]] = {}
         # Fallback source — extracted from node_end events (best-effort).
         self._node_end_fallback: dict[str, list[dict[str, Any]]] = {}
+        self._planner_catalog_hashes: list[str] = []
 
         for ev in events:
             kind = ev.get("kind", "")
@@ -40,7 +41,7 @@ class ReplayProvider:
                 nid = payload.get("node_id", "")
                 recs = payload.get("recorded_responses", [])
                 if nid and isinstance(recs, list) and recs:
-                    self._replay_data[nid] = list(recs)
+                    self._replay_data.setdefault(nid, []).extend(list(recs))
             elif kind == "node_end":
                 nid = payload.get("node_id", "")
                 outputs = payload.get(
@@ -53,6 +54,12 @@ class ReplayProvider:
                         "status": status,
                         "quality_signals": {},
                     })
+            elif kind == "decision":
+                description = str(payload.get("description", ""))
+                if description == "Planner request envelope":
+                    catalog_hash = str(payload.get("operator_catalog_hash", "")).strip()
+                    if catalog_hash:
+                        self._planner_catalog_hashes.append(catalog_hash)
 
     def inject(
         self,
@@ -100,6 +107,12 @@ class ReplayProvider:
                 f"for nodes: {missing}"
             )
         return report
+
+    def latest_operator_catalog_hash(self) -> str | None:
+        """Return the latest planner operator-catalog hash from source trace."""
+        if not self._planner_catalog_hashes:
+            return None
+        return self._planner_catalog_hashes[-1]
 
 
 def load_replay_events(

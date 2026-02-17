@@ -136,3 +136,17 @@ class TestAgentRunnerWithReplay:
         # (we can check via the index store)
         events = list(runner._index.get_trace_events(handle.trace_id))
         assert any(e["kind"] == "node_end" for e in events)
+
+    def test_get_trace_events_public_api(self, runner: AgentRunner) -> None:
+        req = RunRequest(objective="Trace events method test")
+        handle = runner.start(req)
+        events = runner.get_trace_events(handle.trace_id)
+        assert isinstance(events, list)
+        assert any(e.get("kind") == "decision" for e in events)
+
+    def test_get_latest_rendered_artifact_path(self, runner: AgentRunner) -> None:
+        req = RunRequest(objective="Rendered path method test")
+        handle = runner.start(req)
+        rendered_path = runner.get_latest_rendered_artifact_path(handle.trace_id)
+        assert rendered_path is not None
+        assert Path(rendered_path).exists()

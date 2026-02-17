@@ -14,12 +14,16 @@ from __future__ import annotations
 import json
 import logging
 import sys
+from typing import Any, TYPE_CHECKING, Callable
 
 import click
 
 from neuronium_agent.config import load_config
 from neuronium_agent.api import create_runner
-from neuronium_agent.types import ControlCommand, RunRequest
+from neuronium_agent.types import ControlCommand, RunHandle, RunRequest, RunStatus
+
+if TYPE_CHECKING:
+    from neuronium_agent.api import AgentRunner
 
 
 def _setup_logging(level: str = "INFO", json_logs: bool = True) -> None:
@@ -29,6 +33,608 @@ def _setup_logging(level: str = "INFO", json_logs: bool = True) -> None:
         else "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
     )
     logging.basicConfig(level=getattr(logging, level, logging.INFO), format=fmt)
+    # Avoid noisy per-request transport logs; we log node-level lifecycle ourselves.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
+
+
+def _interactive_supervised_loop(
+    runner: AgentRunner,
+    handle: RunHandle,
+) -> tuple[RunHandle, RunStatus]:
+    """Handle PAUSED clarification flow in supervised mode."""
+    status = runner.get_status(handle)
+    while status.state == "PAUSED":
+        pause_context = runner.get_latest_pause_context(handle.trace_id)
+        if not pause_context:
+            break
+        request_artifact_id = str(
+            pause_context.get("clarification_request_artifact_id", "")
+        ).strip()
+        if not request_artifact_id:
+            break
+
+        clarification = runner.read_artifact_json(request_artifact_id)
+        questions = clarification.get("questions", [])
+        if not isinstance(questions, list):
+            questions = []
+
+        click.echo("Run paused: требуется уточнение входных параметров.")
+        answers: dict[str, object] = {}
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            key = str(q.get("key", "")).strip()
+            if not key:
+                continue
+            prompt = str(q.get("prompt", key)).strip() or key
+            answer = click.prompt(prompt, default="", show_default=False).strip()
+            if key in {"doc_paths", "paths"}:
+                answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
+            elif key == "urls":
+                answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
+            else:
+                answers[key] = answer
+
+        payload = {
+            "clarification_request_artifact_id": request_artifact_id,
+            "answers": answers,
+        }
+        runner.control(handle, ControlCommand(type="revise", payload=payload))  # type: ignore[arg-type]
+        runner.control(handle, ControlCommand(type="continue", payload={}))  # type: ignore[arg-type]
+        handle = runner.resume_run(handle.trace_id)
+        status = runner.get_status(handle)
+
+    return handle, status
+
+
+def _extract_latest_plan_payload(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if event.get("kind") != "decision":
+            continue
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        description = str(payload.get("description", ""))
+        if description.startswith("Plan created"):
+            return payload
+    return None
+
+
+def _extract_latest_planner_request_payload(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if event.get("kind") != "decision":
+            continue
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("description") == "Planner request envelope":
+            return payload
+    return None
+
+
+def _extract_latest_verdict_payload(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if event.get("kind") != "critic_verdict":
+            continue
+        payload = event.get("payload", {})
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _extract_best_effort_summary(events: list[dict[str, Any]]) -> str | None:
+    preferred_nodes = (
+        "summarize",
+        "summary",
+        "draft_report",
+        "write_report",
+        "finalize",
+    )
+    for event in reversed(events):
+        if event.get("kind") != "node_end":
+            continue
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("status", "")) != "COMPLETED":
+            continue
+        node_id = str(payload.get("node_id", ""))
+        outputs = payload.get("outputs_summary", {})
+        if not isinstance(outputs, dict):
+            continue
+        for key in ("summary", "content", "report", "final_summary"):
+            value = outputs.get(key)
+            if isinstance(value, str) and value.strip() and (
+                node_id in preferred_nodes or key in {"summary", "final_summary"}
+            ):
+                return value.strip()
+    return None
+
+
+def _extract_user_output_payload(events: list[dict[str, Any]]) -> dict[str, Any] | None:
+    for event in reversed(events):
+        if event.get("kind") != "decision":
+            continue
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if payload.get("description") == "User output extracted":
+            return payload
+    return None
+
+
+def _extract_latest_exported_file(events: list[dict[str, Any]]) -> str | None:
+    for event in reversed(events):
+        if event.get("kind") != "node_end":
+            continue
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("node_id", "")) != "export_user_output":
+            continue
+        if str(payload.get("status", "")) != "COMPLETED":
+            continue
+        outputs = payload.get("outputs_summary", {})
+        if not isinstance(outputs, dict):
+            continue
+        value = outputs.get("path")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _phase_from_boundary(boundary: str) -> str | None:
+    value = str(boundary).strip().lower()
+    if "after_commit" in value:
+        return "commit"
+    if "after_execute" in value:
+        return "execute"
+    if "after_control" in value:
+        return "control"
+    if "after_adapt" in value:
+        return "adapt"
+    if value == "paused":
+        return "paused"
+    if value == "final":
+        return "final"
+    return None
+
+
+def _extract_phase_timeline(events: list[dict[str, Any]]) -> list[str]:
+    timeline: list[str] = []
+    for event in events:
+        if event.get("kind") != "checkpoint":
+            continue
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        resume_ctx = payload.get("resume_context", {})
+        if not isinstance(resume_ctx, dict):
+            continue
+        phase = _phase_from_boundary(str(resume_ctx.get("phase_boundary", "")))
+        if phase is None:
+            continue
+        if not timeline or timeline[-1] != phase:
+            timeline.append(phase)
+    return timeline
+
+
+def _preview_text(value: Any, *, max_len: int = 50) -> str:
+    text = str(value).replace("\n", " ").strip()
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+    return text
+
+
+def _preview_url(value: Any, *, max_len: int = 120) -> str:
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    if len(raw) <= max_len:
+        return raw
+    return raw[:max_len] + "..."
+
+
+def _human_step_title(*, node_id: str, node_type: str, tool_name: str | None) -> str:
+    nid = node_id.strip().lower()
+    tname = (tool_name or "").strip().lower()
+
+    # Prefer semantic node_id (planner controls naming).
+    if nid in {"fetch_html", "web_fetch_html"}:
+        return "Fetch web page"
+    if nid in {"extract_article", "web_extract_article"}:
+        return "Extract article"
+    if nid in {"draft_report", "write_report", "summarize", "summary"}:
+        return "Generate summary"
+    if nid in {"critic_report", "critic", "quality_gate"}:
+        return "Critic evaluation"
+    if nid in {"export_user_output", "export", "write_output"}:
+        return "Write output file"
+
+    # Fallback to tool_name hints.
+    if tname.endswith("web.fetch_html"):
+        return "Fetch web page"
+    if tname.endswith("web.extract_article"):
+        return "Extract article"
+    if tname.endswith("export.write_text"):
+        return "Write output file"
+
+    if node_type == "mcp":
+        return f"Run tool {tool_name or node_id}"
+    if node_type == "model":
+        return f"LLM call {node_id}"
+    if node_type == "code":
+        return f"Run code {node_id}"
+    return f"Run {node_type} {node_id}"
+
+
+def _extract_demo_timeline_steps(
+    events: list[dict[str, Any]],
+    *,
+    limit: int = 20,
+) -> list[str]:
+    """Build a concise, human-readable execution timeline from trace events."""
+    node_types: dict[str, str] = {}
+    node_parameters: dict[str, dict[str, Any]] = {}
+
+    steps: list[str] = []
+    for event in events:
+        kind = event.get("kind")
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+
+        if kind == "node_start":
+            node_id = str(payload.get("node_id", "")).strip()
+            if node_id:
+                node_types[node_id] = str(payload.get("node_type", "")).strip()
+                params = payload.get("parameters", {})
+                if isinstance(params, dict):
+                    node_parameters[node_id] = params
+            continue
+
+        if kind != "node_end":
+            continue
+
+        node_id = str(payload.get("node_id", "")).strip()
+        if not node_id:
+            continue
+        status = str(payload.get("status", "")).strip() or "UNKNOWN"
+        node_type = node_types.get(node_id, str(payload.get("node_type", "")).strip())
+        params = node_parameters.get(node_id, {})
+        if not isinstance(params, dict):
+            params = {}
+
+        inputs = payload.get("inputs", {})
+        if not isinstance(inputs, dict):
+            inputs = {}
+        outputs = payload.get("outputs", {})
+        if not isinstance(outputs, dict):
+            outputs = {}
+
+        tool_name = None
+        tool_args: dict[str, Any] = {}
+        if node_type == "mcp":
+            tool_name = (
+                str(params.get("tool_name", "")).strip()
+                or str(inputs.get("tool_name", "")).strip()
+                or None
+            )
+            tool_args_raw = params.get("tool_args", {})
+            if isinstance(tool_args_raw, dict):
+                tool_args = dict(tool_args_raw)
+
+        title = _human_step_title(node_id=node_id, node_type=node_type, tool_name=tool_name)
+
+        elapsed_ms = payload.get("elapsed_ms")
+        elapsed_part = f" ({elapsed_ms}ms)" if isinstance(elapsed_ms, int) else ""
+
+        # Build small, demo-safe details
+        detail_parts: list[str] = []
+        if node_type == "mcp":
+            url = (
+                tool_args.get("url")
+                or inputs.get("url")
+                or outputs.get("final_url")
+                or outputs.get("url")
+            )
+            if url:
+                detail_parts.append(_preview_url(url))
+            if isinstance(outputs.get("status_code"), (int, str)):
+                detail_parts.append(f"http={outputs.get('status_code')}")
+            if isinstance(outputs.get("bytes_written"), (int, str)):
+                detail_parts.append(f"bytes={outputs.get('bytes_written')}")
+            if isinstance(outputs.get("path"), str) and outputs.get("path", "").strip():
+                detail_parts.append(f'path="{outputs["path"]}"')
+        elif node_type == "model":
+            qs = payload.get("quality_signals", {})
+            if isinstance(qs, dict) and qs.get("tokens_used") is not None:
+                detail_parts.append(f"tokens={qs.get('tokens_used')}")
+            content = outputs.get("content")
+            if isinstance(content, str) and content:
+                detail_parts.append(f"chars={len(content)}")
+
+        details = (" — " + " ".join(detail_parts)) if detail_parts else ""
+        steps.append(f"EXECUTE: {title}{elapsed_part} [{status}]{details}")
+
+    if len(steps) > limit:
+        return steps[-limit:]
+    return steps
+
+
+def _build_live_demo_listener() -> Callable[[dict[str, Any]], None]:
+    """Return a trace event listener that prints demo timeline lines live."""
+    node_types: dict[str, str] = {}
+    node_parameters: dict[str, dict[str, Any]] = {}
+
+    def on_event(ev: dict[str, Any]) -> None:
+        kind = ev.get("kind")
+        payload = ev.get("payload", {})
+        if not isinstance(payload, dict):
+            return
+
+        if kind == "checkpoint":
+            resume = payload.get("resume_context", {})
+            if not isinstance(resume, dict):
+                return
+            phase = _phase_from_boundary(str(resume.get("phase_boundary", "")))
+            if phase:
+                click.echo(f"PHASE: {phase}")
+            return
+
+        if kind == "decision":
+            desc = str(payload.get("description", "")).strip()
+            if desc == "Planner request envelope":
+                backend = str(payload.get("planner_backend", "")).strip()
+                ver = str(payload.get("planner_backend_version", "")).strip()
+                cat = str(payload.get("operator_catalog_hash", "")).strip()
+                backend_sfx = f"{backend}/{ver}" if backend and ver else (backend or "n/a")
+                cat_sfx = (cat[:12] + "...") if len(cat) > 12 else (cat or "n/a")
+                click.echo(f"COMMIT: planner_request backend={backend_sfx} operator_catalog_hash={cat_sfx}")
+            if desc.startswith("Plan created"):
+                nodes = payload.get("nodes", [])
+                edges = payload.get("edges", [])
+                n = len(nodes) if isinstance(nodes, list) else 0
+                e = len(edges) if isinstance(edges, list) else 0
+                click.echo(f"PLAN: runtime DAG built (nodes={n}, edges={e})")
+            return
+
+        if kind == "node_start":
+            node_id = str(payload.get("node_id", "")).strip()
+            if node_id:
+                node_types[node_id] = str(payload.get("node_type", "")).strip()
+                params = payload.get("parameters", {})
+                if isinstance(params, dict):
+                    node_parameters[node_id] = params
+            return
+
+        if kind != "node_end":
+            return
+
+        node_id = str(payload.get("node_id", "")).strip()
+        if not node_id:
+            return
+        status = str(payload.get("status", "")).strip() or "UNKNOWN"
+        node_type = node_types.get(node_id, "unknown")
+        params = node_parameters.get(node_id, {})
+        if not isinstance(params, dict):
+            params = {}
+        outputs = payload.get("outputs", {})
+        if not isinstance(outputs, dict):
+            outputs = {}
+
+        tool_name = None
+        tool_args: dict[str, Any] = {}
+        if node_type == "mcp":
+            tool_name = str(params.get("tool_name", "")).strip() or None
+            raw = params.get("tool_args", {})
+            if isinstance(raw, dict):
+                tool_args = dict(raw)
+
+        title = _human_step_title(node_id=node_id, node_type=node_type, tool_name=tool_name)
+        elapsed_ms = payload.get("elapsed_ms")
+        elapsed_part = f" ({elapsed_ms}ms)" if isinstance(elapsed_ms, int) else ""
+
+        detail_parts: list[str] = []
+        if node_type == "mcp":
+            url = tool_args.get("url") or outputs.get("final_url") or outputs.get("url")
+            if url:
+                detail_parts.append(_preview_url(url))
+            if isinstance(outputs.get("status_code"), (int, str)):
+                detail_parts.append(f"http={outputs.get('status_code')}")
+            if isinstance(outputs.get("bytes_written"), (int, str)):
+                detail_parts.append(f"bytes={outputs.get('bytes_written')}")
+            if isinstance(outputs.get("path"), str) and outputs.get("path", "").strip():
+                detail_parts.append(f'path="{outputs["path"]}"')
+        elif node_type == "model":
+            qs = payload.get("quality_signals", {})
+            if isinstance(qs, dict) and qs.get("tokens_used") is not None:
+                detail_parts.append(f"tokens={qs.get('tokens_used')}")
+            content = outputs.get("content")
+            if isinstance(content, str) and content:
+                detail_parts.append(f"chars={len(content)}")
+
+        details = (" — " + " ".join(detail_parts)) if detail_parts else ""
+        click.echo(f"EXECUTE: {title}{elapsed_part} [{status}]{details}")
+
+    return on_event
+
+
+def _extract_tool_logs(events: list[dict[str, Any]], *, limit: int = 12) -> list[str]:
+    node_types: dict[str, str] = {}
+    logs: list[str] = []
+    for event in events:
+        kind = event.get("kind")
+        payload = event.get("payload", {})
+        if not isinstance(payload, dict):
+            continue
+        if kind == "node_start":
+            node_id = str(payload.get("node_id", "")).strip()
+            node_type = str(payload.get("node_type", "")).strip()
+            if node_id and node_type:
+                node_types[node_id] = node_type
+            continue
+        if kind != "node_end":
+            continue
+        node_id = str(payload.get("node_id", "")).strip()
+        status = str(payload.get("status", "")).strip() or "UNKNOWN"
+        node_type = node_types.get(node_id, "")
+        if node_type != "mcp":
+            continue
+        outputs = payload.get("outputs_summary", {})
+        if not isinstance(outputs, dict):
+            outputs = {}
+        error = payload.get("error")
+
+        parts: list[str] = [f"{node_id}: {status}"]
+        if isinstance(outputs.get("path"), str) and outputs.get("path", "").strip():
+            parts.append(f"path={outputs['path']}")
+        if outputs.get("bytes_written") is not None:
+            parts.append(f"bytes={outputs.get('bytes_written')}")
+        if outputs.get("status_code") is not None:
+            parts.append(f"http={outputs.get('status_code')}")
+        if isinstance(outputs.get("final_url"), str) and outputs.get("final_url", "").strip():
+            parts.append(f"url={outputs['final_url']}")
+        if isinstance(outputs.get("warnings"), str) and outputs.get("warnings", "").strip():
+            parts.append(f"warnings={_preview_text(outputs['warnings'])}")
+        if isinstance(outputs.get("text"), str) and outputs.get("text", "").strip():
+            parts.append(f"text[:50]={_preview_text(outputs['text'])}")
+        if isinstance(error, str) and error.strip():
+            parts.append(f"error={_preview_text(error)}")
+        logs.append(" | ".join(parts))
+
+    if len(logs) > limit:
+        return logs[-limit:]
+    return logs
+
+
+def _print_summary_for_demo(*, summary_text: str | None, exported_file: str | None) -> None:
+    if not summary_text:
+        click.echo("final_summary: n/a")
+        return
+    if exported_file:
+        click.echo("final_summary: omitted (written to exported_file)")
+        return
+
+    raw = summary_text.strip()
+    lower = raw.lower()
+    # Show in CLI only concise plain text (not file-like payloads).
+    looks_like_structured = (
+        lower.startswith("```")
+        or "<html" in lower
+        or "<!doctype html" in lower
+        or raw.startswith("{")
+        or raw.startswith("[")
+    )
+    too_long_for_cli = len(raw) > 500 or raw.count("\n") > 8
+    if looks_like_structured or too_long_for_cli:
+        click.echo("final_summary: omitted (non-plain or large payload)")
+        return
+
+    click.echo(f"final_summary: {raw}")
+
+
+def _print_demo_report(runner: AgentRunner, trace_id: str) -> None:
+    events = runner.get_trace_events(trace_id)
+    planner_req = _extract_latest_planner_request_payload(events)
+    plan = _extract_latest_plan_payload(events)
+    verdict = _extract_latest_verdict_payload(events)
+    user_out = _extract_user_output_payload(events) or {}
+    summary_text = (
+        str(user_out.get("summary")).strip()
+        if isinstance(user_out.get("summary"), str) and user_out.get("summary").strip()
+        else _extract_best_effort_summary(events)
+    )
+    title_text = (
+        str(user_out.get("title")).strip()
+        if isinstance(user_out.get("title"), str) and user_out.get("title").strip()
+        else None
+    )
+    source_url = (
+        str(user_out.get("source_url")).strip()
+        if isinstance(user_out.get("source_url"), str) and user_out.get("source_url").strip()
+        else None
+    )
+    exported_file = _extract_latest_exported_file(events)
+    rendered_path = runner.get_latest_rendered_artifact_path(trace_id)
+    phases = _extract_phase_timeline(events)
+    steps = _extract_demo_timeline_steps(events)
+
+    click.echo("")
+    click.echo("=== demo timeline ===")
+
+    if planner_req:
+        backend = str(planner_req.get("planner_backend", "")).strip()
+        ver = str(planner_req.get("planner_backend_version", "")).strip()
+        cat = str(planner_req.get("operator_catalog_hash", "")).strip()
+        backend_sfx = f"{backend}/{ver}" if backend and ver else (backend or "n/a")
+        cat_sfx = (cat[:12] + "...") if len(cat) > 12 else (cat or "n/a")
+        click.echo(f"COMMIT: planner_request backend={backend_sfx} operator_catalog_hash={cat_sfx}")
+
+    if plan:
+        nodes = plan.get("nodes", [])
+        edges = plan.get("edges", [])
+        planner_backend = str(plan.get("planner_backend", "")).strip()
+        planner_version = str(plan.get("planner_backend_version", "")).strip()
+        click.echo(
+            "PLAN: runtime DAG built "
+            + f"(nodes={len(nodes) if isinstance(nodes, list) else 0}, "
+            + f"edges={len(edges) if isinstance(edges, list) else 0})"
+        )
+        if isinstance(nodes, list) and nodes:
+            click.echo("PLAN: nodes: " + ", ".join(str(n) for n in nodes))
+        if isinstance(edges, list) and edges:
+            # Print compact edge preview for demo (avoid walls of text)
+            edge_preview = ", ".join(f"{a}->{b}" for a, b in edges[:8])
+            if len(edges) > 8:
+                edge_preview += ", ..."
+            click.echo("PLAN: edges: " + edge_preview)
+        if planner_backend:
+            suffix = f"/{planner_version}" if planner_version else ""
+            click.echo(f"COMMIT: planner_backend={planner_backend}{suffix}")
+    else:
+        click.echo("PLAN: n/a")
+
+    if title_text:
+        click.echo(f'TITLE: "{title_text}"')
+    if source_url:
+        click.echo(f"SOURCE: {_preview_url(source_url)}")
+
+    if verdict:
+        click.echo(
+            "CONTROL: critic_verdict="
+            + f"{verdict.get('verdict', 'UNCERTAIN')} "
+            + f"(confidence={verdict.get('confidence', 0.0)})"
+        )
+    else:
+        click.echo("CONTROL: critic_verdict=n/a")
+
+    if exported_file:
+        click.echo(f'OUTPUT: exported_file="{exported_file}"')
+    else:
+        click.echo('OUTPUT: exported_file="n/a"')
+
+    if rendered_path:
+        click.echo(f'OUTPUT: rendered_html="{rendered_path}"')
+    else:
+        click.echo('OUTPUT: rendered_html="n/a"')
+
+    if phases:
+        click.echo("PHASES: " + " -> ".join(phases))
+    else:
+        click.echo("PHASES: n/a")
+
+    if steps:
+        click.echo("STEPS:")
+        for line in steps:
+            click.echo("  - " + line)
+    else:
+        click.echo("STEPS: n/a")
+
+    # Final summary: only if concise plain text (avoid dumping HTML/JSON to console)
+    _print_summary_for_demo(summary_text=summary_text, exported_file=exported_file)
 
 
 @click.group()
@@ -52,7 +658,7 @@ def cli() -> None:
 @click.option(
     "--runbook",
     "runbook_id",
-    default="autofix_demo",
+    default="super_agent_v0",
     show_default=True,
     help="Runbook ID (deterministic plan family) for new runs",
 )
@@ -64,6 +670,20 @@ def cli() -> None:
     help="Execution mode",
 )
 @click.option("--trace-export", "trace_export", default=None, help="Export trace to path")
+@click.option(
+    "--demo-report/--no-demo-report",
+    "demo_report",
+    default=False,
+    show_default=True,
+    help="Print demo summary: plan, verdict, rendered artifact path",
+)
+@click.option(
+    "--demo-live/--no-demo-live",
+    "demo_live",
+    default=False,
+    show_default=True,
+    help="Print demo timeline live during execution (human-readable)",
+)
 def run(
     objective: str | None,
     resume_trace_id: str | None,
@@ -71,6 +691,8 @@ def run(
     config_path: str | None,
     mode: str | None,
     trace_export: str | None,
+    demo_report: bool,
+    demo_live: bool,
 ) -> None:
     """Start a new agent run or resume an existing one.
 
@@ -82,9 +704,14 @@ def run(
         cli_overrides["runtime"] = {"mode": mode}
 
     config = load_config(config_path=config_path, cli_overrides=cli_overrides)
-    _setup_logging(config.logging.level, config.logging.json_logs)
+    # Demo mode: keep console output human-readable and concise.
+    if demo_report or demo_live:
+        _setup_logging("WARNING", json_logs=False)
+    else:
+        _setup_logging(config.logging.level, config.logging.json_logs)
 
-    runner = create_runner(config)
+    listener = _build_live_demo_listener() if demo_live else None
+    runner = create_runner(config, trace_event_listener=listener)
 
     if resume_trace_id:
         # Resume path
@@ -108,6 +735,8 @@ def run(
         sys.exit(1)
 
     status = runner.get_status(handle)
+    if config.runtime.mode == "supervised":
+        handle, status = _interactive_supervised_loop(runner, handle)
 
     click.echo(f"trace_id: {handle.trace_id}")
     click.echo(f"state:    {status.state}")
@@ -122,6 +751,9 @@ def run(
             fmt = "zip"
         runner.export_trace(handle, fmt, trace_export)  # type: ignore[arg-type]
         click.echo(f"Trace exported to: {trace_export}")
+
+    if demo_report:
+        _print_demo_report(runner, handle.trace_id)
 
 
 # ---------------------------------------------------------------------------

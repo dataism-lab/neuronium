@@ -22,9 +22,15 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from neuronium_agent._canonical import canonical_json, artifact_id, canonical_bytes
+from neuronium_agent.artifacts.local_index import LocalArtifactIndex, LocalIndexEntry
+from neuronium_agent.artifacts.renderer import render_run_artifact
+from neuronium_agent.artifacts.user_renderer import (
+    extract_user_facing_summary,
+    render_user_facing_html,
+)
 from neuronium_agent.config import AppConfig
 from neuronium_agent.core.state import (
     AgentState,
@@ -38,7 +44,17 @@ from neuronium_agent.nodes.code_node import CodeNode
 from neuronium_agent.nodes.mcp_node import McpToolNode
 from neuronium_agent.nodes.model_node import ModelNode
 from neuronium_agent.planning.dag import ActionGraph
+from neuronium_agent.planning.dynamic_planner import validate_planned_graph
 from neuronium_agent.planning.htn import HTNPlanner
+from neuronium_agent.planning.operator_catalog import OperatorCatalog
+from neuronium_agent.planning.planner_backend import get_planner_backend
+from neuronium_agent.planning.planner_contract import (
+    DynamicPlannerSpec,
+    PlannerEscalation,
+    PlannerOutcome,
+    PlannerRequest,
+    PlannerResult,
+)
 from neuronium_agent.planning.runbook_contract import StageSuccessGate
 from neuronium_agent.planning.runbook_registry import get_runbook
 from neuronium_agent.storage.blob_store import BlobStore
@@ -70,6 +86,8 @@ class Orchestrator:
         config: AppConfig,
         blob_store: BlobStore,
         index_store: IndexStore,
+        *,
+        trace_event_listener: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self.config = config
         self.blob_store = blob_store
@@ -78,6 +96,8 @@ class Orchestrator:
         self._states: dict[str, AgentState] = {}
         self._recorders: dict[str, TraceRecorder] = {}
         self._memory_store: Any | None = None  # lazy init
+        self._operator_catalog = OperatorCatalog.default()
+        self._trace_event_listener = trace_event_listener
 
     # ------------------------------------------------------------------
     # Public
@@ -116,7 +136,11 @@ class Orchestrator:
         )
 
         # Create trace recorder
-        recorder = TraceRecorder(trace_id, self.index_store)
+        recorder = TraceRecorder(
+            trace_id,
+            self.index_store,
+            event_listener=self._trace_event_listener,
+        )
         self._recorders[trace_id] = recorder
 
         recorder.record_decision(
@@ -195,7 +219,11 @@ class Orchestrator:
             created_at=now.isoformat(),
         )
 
-        recorder = TraceRecorder(trace_id, self.index_store)
+        recorder = TraceRecorder(
+            trace_id,
+            self.index_store,
+            event_listener=self._trace_event_listener,
+        )
         self._recorders[trace_id] = recorder
         recorder.record_decision(
             "Replay started",
@@ -282,7 +310,11 @@ class Orchestrator:
             self._states[trace_id] = state
 
         if recorder is None:
-            recorder = TraceRecorder(trace_id, self.index_store)
+            recorder = TraceRecorder(
+                trace_id,
+                self.index_store,
+                event_listener=self._trace_event_listener,
+            )
             self._recorders[trace_id] = recorder
 
         cmd = command.type
@@ -313,10 +345,49 @@ class Orchestrator:
             return self.get_status(trace_id)
 
         if cmd == "revise":
+            if state.intention:
+                state.intention.phase = IntentionPhase.ADAPT
             new_constraints = payload.get("constraints_add", [])
             if state.intention and new_constraints:
                 state.intention.constraints.extend(new_constraints)
-            self._record_control_decision(recorder, state, cmd, payload)
+            answers = payload.get("answers", {})
+            if not isinstance(answers, dict):
+                answers = {}
+            answer_text = payload.get("answer_text")
+            if not isinstance(answer_text, str):
+                answer_text = None
+            request_artifact_id = str(
+                payload.get("clarification_request_artifact_id", "")
+            ).strip()
+
+            decision_payload = dict(payload)
+            if answers or answer_text:
+                plan_id = (
+                    state.intention.plan_id
+                    if state.intention and state.intention.plan_id
+                    else "no-plan"
+                )
+                response_payload = {
+                    "request_artifact_id": request_artifact_id,
+                    "answers": answers,
+                    "answer_text": answer_text,
+                }
+                response_artifact_id = self._persist_control_artifact(
+                    artifact_type="planner.clarification_response",
+                    payload=response_payload,
+                    produced_by_node_ref=(
+                        f"{state.execution_id}:{plan_id}/control/revise"
+                    ),
+                    parent_artifact_ids=[request_artifact_id] if request_artifact_id else [],
+                )
+                decision_payload["clarification_response_artifact_id"] = response_artifact_id
+                if request_artifact_id:
+                    self.index_store.record_lineage_edge(
+                        request_artifact_id,
+                        response_artifact_id,
+                        "clarification",
+                    )
+            self._record_control_decision(recorder, state, cmd, decision_payload)
             return self.get_status(trace_id)
 
         if cmd == "escalate":
@@ -386,7 +457,11 @@ class Orchestrator:
         state.run_state = RunState.RUNNING
 
         self._states[trace_id] = state
-        recorder = TraceRecorder(trace_id, self.index_store)
+        recorder = TraceRecorder(
+            trace_id,
+            self.index_store,
+            event_listener=self._trace_event_listener,
+        )
         self._recorders[trace_id] = recorder
 
         recorder.record_decision(
@@ -514,39 +589,119 @@ class Orchestrator:
                     skip_execute = resume_boundary in past_commit
                     skip_control = resume_boundary in past_control
 
+                graph = stage.graph
+                if stage.dynamic_planner is not None and skip_commit:
+                    planned_graph = (resume_ctx or {}).get("planned_graph")
+                    if not isinstance(planned_graph, dict):
+                        raise ValueError(
+                            "Dynamic planner resume requires 'planned_graph' "
+                            "in checkpoint resume_context"
+                        )
+                    graph = ActionGraph.model_validate(planned_graph)
+                    graph = validate_planned_graph(
+                        graph,
+                        spec=stage.dynamic_planner,
+                        operator_catalog=self._operator_catalog,
+                    )
+
                 # -- stage_start event -----------------------------------------
                 recorder.record("stage_start", {
                     "stage_id": stage.stage_id,
                     "stage_index": stage_index,
                     "runbook_id": runbook_id,
-                    "plan_id": stage.graph.metadata.plan_id,
+                    "plan_id": graph.metadata.plan_id,
                 })
 
-                graph = stage.graph
                 gate = stage.success_gate
                 results: dict[str, NodeOutput] = {}
                 verdict: DemoCriticVerdict | None = None
+                planner_backend_name = ""
+                planner_backend_version = ""
+                operator_catalog_hash = ""
+                planner_trace_payload: dict[str, Any] = {}
 
                 # -- COMMIT ----------------------------------------------------
                 if not skip_commit:
                     state.intention.phase = IntentionPhase.COMMIT  # type: ignore[union-attr]
+                    if stage.dynamic_planner is not None:
+                        planner_outcome = self._plan_dynamic_graph(
+                            state=state,
+                            recorder=recorder,
+                            replay_provider=replay_provider,
+                            runbook_id=runbook_id,
+                            stage_id=stage.stage_id,
+                            metadata=metadata,
+                            spec=stage.dynamic_planner,
+                        )
+                        if isinstance(planner_outcome, PlannerEscalation):
+                            self._pause_for_planner_escalation(
+                                state=state,
+                                recorder=recorder,
+                                iteration=iteration,
+                                runbook_id=runbook_id,
+                                stage_id=stage.stage_id,
+                                stage_index=stage_index,
+                                escalation=planner_outcome,
+                            )
+                            return
+                        planner_result = planner_outcome
+                        graph = planner_result.action_graph
+                        planner_backend_name = planner_result.backend_name
+                        planner_backend_version = planner_result.backend_version
+                        operator_catalog_hash = planner_result.operator_catalog_hash or ""
+                        if planner_result.decision_trace is not None:
+                            planner_trace_payload = {
+                                "subgoals": list(planner_result.decision_trace.subgoals),
+                                "selected_methods": list(planner_result.decision_trace.selected_methods),
+                                "justification_keys": list(planner_result.decision_trace.justification_keys),
+                                "decomposition_steps": list(planner_result.decision_trace.decomposition_steps),
+                                "method_expansion_path": list(planner_result.decision_trace.method_expansion_path),
+                                "leaf_operators": list(planner_result.decision_trace.leaf_operators),
+                                "notes": dict(planner_result.decision_trace.notes),
+                            }
+                        recorder.record_decision(
+                            "Plan created (dynamic)",
+                            {
+                                "iteration": iteration,
+                                "plan_id": graph.metadata.plan_id,
+                                "runbook_id": runbook_id,
+                                "stage_id": stage.stage_id,
+                                "nodes": [n.node_id for n in graph.nodes],
+                                "edges": [(e.source, e.target) for e in graph.edges],
+                                "planner_backend": planner_backend_name,
+                                "planner_backend_version": planner_backend_version,
+                                "operator_catalog_hash": operator_catalog_hash,
+                                "planner_decision_trace": planner_trace_payload,
+                            },
+                        )
+                    else:
+                        recorder.record_decision(
+                            f"Plan created ({runbook_id})",
+                            {
+                                "iteration": iteration,
+                                "plan_id": graph.metadata.plan_id,
+                                "runbook_id": runbook_id,
+                                "stage_id": stage.stage_id,
+                                "nodes": [n.node_id for n in graph.nodes],
+                                "edges": [(e.source, e.target) for e in graph.edges],
+                            },
+                        )
                     state.intention.plan_id = graph.metadata.plan_id  # type: ignore[union-attr]
-                    recorder.record_decision(
-                        f"Plan created ({runbook_id})",
-                        {
-                            "iteration": iteration,
-                            "plan_id": graph.metadata.plan_id,
-                            "runbook_id": runbook_id,
-                            "stage_id": stage.stage_id,
-                            "nodes": [n.node_id for n in graph.nodes],
-                            "edges": [(e.source, e.target) for e in graph.edges],
-                        },
-                    )
+                    commit_extra: dict[str, Any] = {
+                        "runbook_id": runbook_id,
+                        "stage_id": stage.stage_id,
+                        "stage_index": stage_index,
+                    }
+                    if stage.dynamic_planner is not None:
+                        commit_extra["planned_graph"] = graph.model_dump(mode="json")
+                        commit_extra["planner_backend"] = planner_backend_name
+                        commit_extra["planner_backend_version"] = planner_backend_version
+                        commit_extra["operator_catalog_hash"] = operator_catalog_hash
+                        commit_extra["planner_decision_trace"] = planner_trace_payload
                     self._write_phase_checkpoint(
                         state, recorder, iteration,
                         f"after_commit_iter{iteration}",
-                        extra={"runbook_id": runbook_id, "stage_id": stage.stage_id,
-                               "stage_index": stage_index},
+                        extra=commit_extra,
                     )
 
                 # -- EXECUTE ---------------------------------------------------
@@ -567,7 +722,12 @@ class Orchestrator:
                             "stage_id": stage.stage_id,
                             "stage_index": stage_index,
                             "gate_snapshot": gate_snapshot,
-                        },
+                        }
+                        | (
+                            {"planned_graph": graph.model_dump(mode="json")}
+                            if stage.dynamic_planner is not None
+                            else {}
+                        ),
                     )
                 else:
                     # Restore gate snapshot from resume context
@@ -604,8 +764,16 @@ class Orchestrator:
                     self._write_phase_checkpoint(
                         state, recorder, iteration,
                         f"after_control_iter{iteration}",
-                        extra={"runbook_id": runbook_id, "stage_id": stage.stage_id,
-                               "stage_index": stage_index},
+                        extra={
+                            "runbook_id": runbook_id,
+                            "stage_id": stage.stage_id,
+                            "stage_index": stage_index,
+                        }
+                        | (
+                            {"planned_graph": graph.model_dump(mode="json")}
+                            if stage.dynamic_planner is not None
+                            else {}
+                        ),
                     )
 
                 # -- ADAPT (evaluate gate & finish/continue) -------------------
@@ -640,6 +808,12 @@ class Orchestrator:
                     )
                     if results:
                         self._persist_artifacts(state, results, recorder)
+                        self._persist_local_rendered_artifact(
+                            state=state,
+                            recorder=recorder,
+                            results=results,
+                            runbook_id=runbook_id,
+                        )
                     return
 
             # All stages passed
@@ -653,6 +827,12 @@ class Orchestrator:
             )
             if results:
                 self._persist_artifacts(state, results, recorder)
+                self._persist_local_rendered_artifact(
+                    state=state,
+                    recorder=recorder,
+                    results=results,
+                    runbook_id=runbook_id,
+                )
 
         except Exception as exc:
             logger.exception("Runbook %s failed", runbook_id)
@@ -781,6 +961,12 @@ class Orchestrator:
                     state.intention.phase = IntentionPhase.DONE  # type: ignore[union-attr]
                     self._write_phase_checkpoint(state, recorder, 1, "final")
                     self._persist_artifacts(state, results1, recorder)
+                    self._persist_local_rendered_artifact(
+                        state=state,
+                        recorder=recorder,
+                        results=results1,
+                        runbook_id="autofix_demo",
+                    )
                     return
 
             # -- ADAPT iter1 (replan decision) ----------------------------
@@ -910,8 +1096,20 @@ class Orchestrator:
             # Persist artifacts from whichever iteration produced results
             if results1:
                 self._persist_artifacts(state, results1, recorder)
+                self._persist_local_rendered_artifact(
+                    state=state,
+                    recorder=recorder,
+                    results=results1,
+                    runbook_id="autofix_demo",
+                )
             if results2:
                 self._persist_artifacts(state, results2, recorder)
+                self._persist_local_rendered_artifact(
+                    state=state,
+                    recorder=recorder,
+                    results=results2,
+                    runbook_id="autofix_demo",
+                )
 
         except Exception as exc:
             logger.exception("Orchestrator cycle failed")
@@ -1006,19 +1204,61 @@ class Orchestrator:
             payload = ev.get("payload", {})
             if not isinstance(payload, dict):
                 continue
+            description = str(payload.get("description", ""))
+            if description == "control_command: revise":
+                control_payload = payload.get("payload", {})
+                if isinstance(control_payload, dict):
+                    req_aid = str(
+                        control_payload.get("clarification_request_artifact_id", "")
+                    ).strip()
+                    resp_aid = str(
+                        control_payload.get("clarification_response_artifact_id", "")
+                    ).strip()
+                    if req_aid:
+                        metadata["clarification_request_artifact_id"] = req_aid
+                    if resp_aid:
+                        metadata["clarification_response_artifact_id"] = resp_aid
+
+                    answers = control_payload.get("answers", {})
+                    if isinstance(answers, dict):
+                        if isinstance(answers.get("url"), str) and answers["url"].strip():
+                            metadata["url"] = answers["url"].strip()
+                            metadata["urls"] = [answers["url"].strip()]
+                        raw_urls = answers.get("urls")
+                        if isinstance(raw_urls, list):
+                            urls = [str(x).strip() for x in raw_urls if str(x).strip()]
+                            if urls:
+                                metadata["urls"] = urls
+                                metadata["url"] = urls[0]
+                        raw_doc_paths = answers.get("doc_paths")
+                        if isinstance(raw_doc_paths, list):
+                            doc_paths = [str(x).strip() for x in raw_doc_paths if str(x).strip()]
+                            if doc_paths:
+                                metadata["doc_paths"] = doc_paths
+                        elif isinstance(raw_doc_paths, str) and raw_doc_paths.strip():
+                            parts = [p.strip() for p in raw_doc_paths.split(",") if p.strip()]
+                            if parts:
+                                metadata["doc_paths"] = parts
+
+                        out_fn = answers.get("output_filename")
+                        if isinstance(out_fn, str) and out_fn.strip():
+                            metadata["output_filename"] = out_fn.strip()
+                        out_text = answers.get("output_text")
+                        if isinstance(out_text, str) and out_text.strip():
+                            metadata["output_text"] = out_text.strip()
             # Pick up doc_paths for docs_report_v1
             if (
                 payload.get("runbook_id") == runbook_id
                 and isinstance(payload.get("doc_paths"), list)
             ):
                 metadata["doc_paths"] = [str(p) for p in payload["doc_paths"]]
-                break
+                continue
             if (
                 "Plan created" in str(payload.get("description", ""))
                 and isinstance(payload.get("doc_paths"), list)
             ):
                 metadata["doc_paths"] = [str(p) for p in payload["doc_paths"]]
-                break
+                continue
         return metadata
 
     # -- Runbook gate helpers -----------------------------------------------
@@ -1189,6 +1429,189 @@ class Orchestrator:
     # Execution (shared between iterations)
     # ------------------------------------------------------------------
 
+    def _plan_dynamic_graph(
+        self,
+        *,
+        state: AgentState,
+        recorder: TraceRecorder,
+        replay_provider: ReplayProvider | None,
+        runbook_id: str,
+        stage_id: str,
+        metadata: dict[str, Any],
+        spec: DynamicPlannerSpec,
+    ) -> PlannerOutcome:
+        """Run planner backend and return a validated planner result."""
+        catalog_hash = self._operator_catalog.catalog_hash()
+        if replay_provider is not None:
+            replay_hash = replay_provider.latest_operator_catalog_hash()
+            if replay_hash and replay_hash != catalog_hash:
+                raise ValueError(
+                    "Strict replay failed: operator catalog hash mismatch "
+                    f"(live={catalog_hash}, replay={replay_hash})"
+                )
+        request = PlannerRequest(
+            objective=state.intention.objective,  # type: ignore[union-attr]
+            constraints=list(state.intention.constraints),  # type: ignore[union-attr]
+            metadata=metadata,
+            runbook_id=runbook_id,
+            stage_id=stage_id,
+            execution_id=state.execution_id,
+            spec=spec,
+            operator_catalog_hash=catalog_hash,
+            allowed_capabilities={
+                "node_types": list(spec.allowed_node_types),
+                "tools": list(spec.allowed_tool_names),
+            },
+        )
+
+        recorder.record_decision(
+            "Planner request envelope",
+            {
+                "runbook_id": runbook_id,
+                "stage_id": stage_id,
+                "planner_backend": spec.backend_name,
+                "planner_backend_version": spec.backend_version,
+                "operator_catalog_hash": catalog_hash,
+                "allowed_capabilities": request.allowed_capabilities,
+            },
+        )
+
+        backend = get_planner_backend(spec.backend_name)
+        result = backend.plan(
+            request=request,
+            execute_graph=lambda graph, initial_inputs, suppress_node_events: self._execute(
+                state,
+                graph,
+                recorder,
+                replay_provider=replay_provider,
+                initial_inputs_override=initial_inputs,
+                suppress_node_events=suppress_node_events,
+            ),
+        )
+        if isinstance(result, PlannerEscalation):
+            final_escalation = PlannerEscalation(
+                reason=result.reason,
+                backend_name=result.backend_name,
+                backend_version=result.backend_version,
+                clarification_request_artifact_id=result.clarification_request_artifact_id,
+                missing_fields=list(result.missing_fields),
+                evidence_artifact_ids=list(result.evidence_artifact_ids),
+                operator_catalog_hash=result.operator_catalog_hash or catalog_hash,
+                decision_trace=result.decision_trace,
+            )
+            recorder.record_decision(
+                "Planner escalation envelope",
+                {
+                    "runbook_id": runbook_id,
+                    "stage_id": stage_id,
+                    "planner_backend": final_escalation.backend_name,
+                    "planner_backend_version": final_escalation.backend_version,
+                    "reason": final_escalation.reason,
+                    "clarification_request_artifact_id": final_escalation.clarification_request_artifact_id,
+                    "missing_fields": final_escalation.missing_fields,
+                    "evidence_artifact_ids": final_escalation.evidence_artifact_ids,
+                    "operator_catalog_hash": final_escalation.operator_catalog_hash,
+                },
+            )
+            return final_escalation
+        validated = validate_planned_graph(
+            result.action_graph,
+            spec=spec,
+            operator_catalog=self._operator_catalog,
+        )
+        final_result = PlannerResult(
+            action_graph=validated,
+            backend_name=result.backend_name,
+            backend_version=result.backend_version,
+            operator_catalog_hash=result.operator_catalog_hash,
+            decision_trace=result.decision_trace,
+        )
+        recorder.record_decision(
+            "Planner result envelope",
+            {
+                "runbook_id": runbook_id,
+                "stage_id": stage_id,
+                "planner_backend": final_result.backend_name,
+                "planner_backend_version": final_result.backend_version,
+                "plan_id": validated.metadata.plan_id,
+                "operator_catalog_hash": final_result.operator_catalog_hash,
+                "decision_trace_notes": (
+                    dict(final_result.decision_trace.notes)
+                    if final_result.decision_trace is not None
+                    else {}
+                ),
+                "decision_trace_subgoal_count": (
+                    len(final_result.decision_trace.subgoals)
+                    if final_result.decision_trace is not None
+                    else 0
+                ),
+            },
+        )
+        return final_result
+
+    def _pause_for_planner_escalation(
+        self,
+        *,
+        state: AgentState,
+        recorder: TraceRecorder,
+        iteration: int,
+        runbook_id: str,
+        stage_id: str,
+        stage_index: int,
+        escalation: PlannerEscalation,
+    ) -> None:
+        """Handle planner escalation as Commit→Adapt→Escalate suspension."""
+        state.intention.phase = IntentionPhase.ADAPT  # type: ignore[union-attr]
+        recorder.record_decision(
+            "Missing critical parameters",
+            {
+                "iteration": iteration,
+                "runbook_id": runbook_id,
+                "stage_id": stage_id,
+                "reason": escalation.reason,
+                "missing_fields": list(escalation.missing_fields),
+                "evidence": [
+                    {"artifact_id": aid, "relevance_score": 1.0}
+                    for aid in escalation.evidence_artifact_ids
+                ],
+            },
+        )
+        recorder.record_decision(
+            "Escalation requested",
+            {
+                "iteration": iteration,
+                "runbook_id": runbook_id,
+                "stage_id": stage_id,
+                "planner_backend": escalation.backend_name,
+                "planner_backend_version": escalation.backend_version,
+                "clarification_request_artifact_id": escalation.clarification_request_artifact_id,
+                "missing_fields": list(escalation.missing_fields),
+                "evidence_artifact_ids": list(escalation.evidence_artifact_ids),
+            },
+        )
+        state.transition_to(
+            RunState.PAUSED,
+            "Clarification required: missing critical parameters",
+        )
+        self.index_store.update_run_state(state.trace_id, "PAUSED")
+        self._write_phase_checkpoint(
+            state,
+            recorder,
+            iteration,
+            "paused",
+            extra={
+                "runbook_id": runbook_id,
+                "stage_id": stage_id,
+                "stage_index": stage_index,
+                "clarification_request_artifact_id": escalation.clarification_request_artifact_id,
+                "clarification_missing_fields": list(escalation.missing_fields),
+                "clarification_evidence_artifact_ids": list(escalation.evidence_artifact_ids),
+                "planner_backend": escalation.backend_name,
+                "planner_backend_version": escalation.backend_version,
+                "operator_catalog_hash": escalation.operator_catalog_hash or "",
+            },
+        )
+
     def _execute(
         self,
         state: AgentState,
@@ -1197,6 +1620,7 @@ class Orchestrator:
         *,
         replay_provider: ReplayProvider | None = None,
         initial_inputs_override: dict[str, Any] | None = None,
+        suppress_node_events: bool = False,
     ) -> dict[str, NodeOutput]:
         """Build node registry and execute the DAG."""
         registry = self._build_node_registry(graph)
@@ -1212,6 +1636,8 @@ class Orchestrator:
             recorder.record_decision("Replay responses injected", report)
 
         def trace_cb(kind: str, payload: dict[str, Any]) -> None:
+            if suppress_node_events and kind in {"node_start", "node_end"}:
+                return
             recorder.record(kind, payload)
 
         executor = DAGExecutor(
@@ -1289,6 +1715,7 @@ class Orchestrator:
                     policy={
                         "fs_roots_allowlist": roots,
                         "fs_max_read_bytes": 1_000_000,
+                        "fs_max_write_bytes": 1_000_000,
                     },
                     tool_runtime=self._build_tool_runtime(),
                 )
@@ -1316,6 +1743,36 @@ class Orchestrator:
     # ------------------------------------------------------------------
     # Artifact persistence
     # ------------------------------------------------------------------
+
+    def _persist_control_artifact(
+        self,
+        *,
+        artifact_type: str,
+        payload: dict[str, Any],
+        produced_by_node_ref: str,
+        parent_artifact_ids: list[str],
+    ) -> str:
+        """Persist control-protocol payload as content-addressed artifact."""
+        content = canonical_bytes(payload)
+        ctx = {
+            "node_ref": produced_by_node_ref,
+            "input_artifact_ids": sorted(parent_artifact_ids),
+        }
+        aid = artifact_id(content, ctx)
+        now = datetime.now(timezone.utc).isoformat()
+        self.blob_store.put(aid, content, "application/json")
+        self.index_store.record_artifact_metadata(
+            artifact_id=aid,
+            artifact_type=artifact_type,
+            created_at=now,
+            produced_by_node_ref=produced_by_node_ref,
+            inputs_json=canonical_json({"parent_artifact_ids": sorted(parent_artifact_ids)}),
+            quality_signals_json="{}",
+            blob_key=aid,
+            media_type="application/json",
+            size_bytes=len(content),
+        )
+        return aid
 
     def _persist_artifacts(
         self,
@@ -1350,3 +1807,75 @@ class Orchestrator:
                 media_type="application/json",
                 size_bytes=len(content),
             )
+
+    def _persist_local_rendered_artifact(
+        self,
+        *,
+        state: AgentState,
+        recorder: TraceRecorder,
+        results: dict[str, NodeOutput],
+        runbook_id: str,
+    ) -> None:
+        """Render deterministic artifacts and append local gallery index.
+
+        Produces:
+        - debug artifact (all node outputs)
+        - user-facing artifact (title + summary + source)
+        Index points to user-facing artifact when available.
+        """
+        objective = state.intention.objective  # type: ignore[union-attr]
+        plan_id = state.intention.plan_id or ""  # type: ignore[union-attr]
+        debug_rendered = render_run_artifact(
+            data_dir=self.config.project.data_dir,
+            trace_id=state.trace_id,
+            runbook_id=runbook_id,
+            objective=objective,
+            plan_id=plan_id,
+            results=results,
+        )
+        if debug_rendered is None:
+            return
+
+        user_path = render_user_facing_html(
+            data_dir=self.config.project.data_dir,
+            trace_id=state.trace_id,
+            runbook_id=runbook_id,
+            objective=objective,
+            plan_id=plan_id,
+            results=results,
+            debug_artifact_path=debug_rendered.path,
+        )
+        chosen_path = user_path or debug_rendered.path
+
+        # Record a compact user output decision for CLI/demo
+        user_summary = extract_user_facing_summary(results)
+        recorder.record_decision(
+            "User output extracted",
+            {
+                "runbook_id": runbook_id,
+                "trace_id": state.trace_id,
+                "title": user_summary.title,
+                "summary": user_summary.summary,
+                "source_url": user_summary.source_url,
+            },
+        )
+
+        index = LocalArtifactIndex(self.config.project.data_dir)
+        index.append(LocalIndexEntry(
+            trace_id=state.trace_id,
+            runbook_id=runbook_id,
+            objective=objective,
+            artifact_path=chosen_path,
+            created_at=debug_rendered.created_at,
+            plan_id=plan_id,
+        ))
+        recorder.record_decision(
+            "Local rendered artifact saved",
+            {
+                "runbook_id": runbook_id,
+                "trace_id": state.trace_id,
+                "artifact_path": chosen_path,
+                "artifact_path_debug": debug_rendered.path,
+                "artifact_path_user": user_path,
+            },
+        )
