@@ -1,4 +1,4 @@
-# NEURONIUM Agent
+# NEURONIUM AI
 
 <img width="1009" height="430" alt="Nr" src="https://github.com/user-attachments/assets/46c868b3-ab4f-4230-8d98-4ad4dbdabd7e" />
 
