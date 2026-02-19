@@ -846,10 +846,8 @@ class HtnRecursivePlannerBackend:
                             "You generate clarification questions for a user in Russian. "
                             "Use only provided missing field keys. Return strict JSON."
                         ),
-                        # Keep clarification UX snappy. If this model call is slow,
-                        # fall back to deterministic questions instead of waiting.
-                        "timeout_seconds": 12,
-                        "max_retries": 0,
+                        "timeout_seconds": 60,
+                        "max_retries": 1,
                         "json_schema": schema,
                     },
                 )

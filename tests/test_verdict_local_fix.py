@@ -54,11 +54,13 @@ class TestDemoCriticVerdictSuggestions:
         assert v.gaps == ["missing check"]
         assert v.suggestions == []
 
-    def test_critic_json_schema_suggestions_optional(self) -> None:
+    def test_critic_json_schema_suggestions_strict(self) -> None:
         schema = critic_json_schema()
         assert "suggestions" in schema.get("properties", {})
         required = schema.get("required", [])
-        assert "suggestions" not in required
+        assert "suggestions" in required
+        items = schema["properties"]["suggestions"]["items"]
+        assert items["additionalProperties"] is False
 
 
 class TestExecutorVerdictFixPrompt:

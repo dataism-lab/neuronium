@@ -57,9 +57,18 @@ The CLI loads `.env` automatically (without overriding already set environment v
 ### 4. Run
 
 ```bash
-# CLI
+# CLI (human-readable output by default)
 neuronium-agent run --objective "Write a fibonacci function in Python" \
     --trace-export ./trace.jsonl
+
+# Verbose output (stdout/stderr previews, critic evidence)
+neuronium-agent run -o "Write fibonacci" -v
+
+# Execution summary at the end (plan, verdict, artifacts)
+neuronium-agent run -o "Write fibonacci" --summary
+
+# Raw logs for debugging
+neuronium-agent run -o "Write fibonacci" --raw-logs
 
 # Python API
 from neuronium_agent.api import create_runner
@@ -156,7 +165,11 @@ pytest tests/ -v
 
 | Command | Description |
 |---------|-------------|
-| `neuronium-agent run --objective "..."` | Start agent (default runbook `super_agent_v0`; use `--runbook ID` to override) |
+| `neuronium-agent run -o "..."` | Start agent (human-readable timeline by default) |
+| `neuronium-agent run -o "..." --runbook ID` | Start with a specific runbook (default: `super_agent_v0`) |
+| `neuronium-agent run -o "..." -v` | Verbose output (stdout/stderr, critic evidence) |
+| `neuronium-agent run -o "..." --summary` | Print execution summary after run |
+| `neuronium-agent run -o "..." --raw-logs` | Raw logs instead of timeline |
 | `neuronium-agent run --trace-id ID` | Resume run from checkpoint |
 | `neuronium-agent status --trace-id ID` | Check run status |
 | `neuronium-agent control --trace-id ID --command pause` | Control (continue / pause / revise / replan / stop / escalate) |

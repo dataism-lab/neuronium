@@ -818,25 +818,25 @@ def cli() -> None:
 )
 @click.option("--trace-export", "trace_export", default=None, help="Export trace to path")
 @click.option(
-    "--demo-report/--no-demo-report",
+    "--summary",
     "demo_report",
+    is_flag=True,
     default=False,
-    show_default=True,
-    help="Print demo summary: plan, verdict, rendered artifact path",
+    help="Print execution summary (plan, verdict, artifacts) after run completes",
 )
 @click.option(
-    "--demo-live/--no-demo-live",
-    "demo_live",
+    "--raw-logs",
+    "raw_logs",
+    is_flag=True,
     default=False,
-    show_default=True,
-    help="Print demo timeline live during execution (human-readable)",
+    help="Show raw logs instead of human-readable timeline",
 )
 @click.option(
-    "--demo-verbose/--no-demo-verbose",
+    "--verbose", "-v",
     "demo_verbose",
+    is_flag=True,
     default=False,
-    show_default=True,
-    help="Increase demo timeline verbosity (stdout/stderr previews, critic summaries)",
+    help="Increase output detail level (stdout/stderr previews, critic evidence)",
 )
 @click.option(
     "--autofix-inject-bug/--no-autofix-inject-bug",
@@ -860,7 +860,7 @@ def run(
     mode: str | None,
     trace_export: str | None,
     demo_report: bool,
-    demo_live: bool,
+    raw_logs: bool,
     demo_verbose: bool,
     autofix_inject_bug: bool,
     auto_clarify: bool,
@@ -875,8 +875,8 @@ def run(
         cli_overrides["runtime"] = {"mode": mode}
 
     config = load_config(config_path=config_path, cli_overrides=cli_overrides)
-    # Demo mode: keep console output human-readable and concise.
-    if demo_report or demo_live:
+    demo_live = not raw_logs
+    if demo_live:
         _setup_logging("WARNING", json_logs=False)
     else:
         _setup_logging(config.logging.level, config.logging.json_logs)

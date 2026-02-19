@@ -39,17 +39,31 @@ class DemoCriticVerdict(BaseModel):
 def critic_json_schema() -> dict[str, Any]:
     """Return an OpenAI-strict-compatible JSON schema for the critic output.
 
-    Some OpenAI-compatible endpoints require:
-    - `additionalProperties: false` for objects
-    - `required` to include every key in `properties` except optional ones (e.g. suggestions)
+    OpenAI structured-output strict mode requires every nested object to have
+    explicit ``properties``, ``required``, and ``additionalProperties: false``.
+    Pydantic's ``dict[str, Any]`` emits a bare ``{"type": "object"}`` which
+    violates this, so we patch the ``suggestions`` items inline.
     """
     schema: dict[str, Any] = DemoCriticVerdict.model_json_schema()
     props = schema.get("properties")
     if isinstance(props, dict):
-        # Keep suggestions optional so old responses without it still parse
-        required = [k for k in props if k != "suggestions"]
-        schema["required"] = required
+        schema["required"] = sorted(props.keys())
         schema["additionalProperties"] = False
+
+        if "suggestions" in props:
+            props["suggestions"] = {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string"},
+                        "expected_improvement": {"type": "string"},
+                        "effort_estimate": {"type": "string"},
+                    },
+                    "required": ["action", "expected_improvement", "effort_estimate"],
+                    "additionalProperties": False,
+                },
+            }
     return schema
 
 

@@ -64,5 +64,5 @@ store_in_sqlite = true
 
 [logging]
 level = "INFO"
-json = true
+json = false
 path = ".neuronium/logs/neuronium.jsonl"
