@@ -992,7 +992,11 @@ def status(trace_id: str, config_path: str | None) -> None:
     type=click.Choice(["continue", "pause", "revise", "replan", "stop", "escalate"]),
     help="Control command",
 )
-@click.option("--payload", default="{}", help="JSON payload")
+@click.option(
+    "--payload",
+    default="{}",
+    help="JSON payload. For stop: optional 'mode' (graceful|immediate), 'export_path' (trace file path).",
+)
 @click.option("--config", "config_path", default=None, help="Path to neuronium.toml")
 def control(
     trace_id: str,

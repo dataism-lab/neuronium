@@ -31,6 +31,10 @@ phase-boundary checkpoint; mid-node restoration is never attempted.
 
   Optional keys: metadata, gate_snapshot, planned_graph, stage_id,
   stage_retry_count — for full stage and gate restoration.
+
+**Minimal stop checkpoint (phase_boundary="cancelled_mid_execute")**
+  Written on stop with mode=immediate. Audit-only: no completed_node_results
+  or pending_node_ids; resume from this boundary is not supported in v1.
 """
 
 from __future__ import annotations
@@ -59,13 +63,15 @@ PHASE_BOUNDARIES = frozenset({
     "final",
     "paused",
     "paused_mid_execute",  # requires extended resume_context (see MID_EXECUTE_*)
+    "cancelled_mid_execute",  # minimal audit-only; no resume in v1
 })
 """Valid phase-boundary labels that support resume.
 
 For ``paused_mid_execute``, resume_context must satisfy the extended
 contract: required keys in :data:`MID_EXECUTE_REQUIRED_KEYS`, optional in
 :data:`MID_EXECUTE_OPTIONAL_KEYS`. Validation is performed in
-:func:`load_state_from_checkpoint`.
+:func:`load_state_from_checkpoint`. ``cancelled_mid_execute`` is minimal
+(audit only); no validation for resume keys.
 """
 
 # -- Mid-execution checkpoint contract (paused_mid_execute) ------------------

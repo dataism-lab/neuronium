@@ -67,6 +67,7 @@ from neuronium_agent.trace.checkpoints import (
     load_state_from_checkpoint,
     CheckpointError,
 )
+from neuronium_agent.trace.exporter import TraceExporter
 from neuronium_agent.trace.decision_record import (
     DecisionAuthority,
     DecisionRecord,
@@ -383,9 +384,15 @@ class Orchestrator:
             return self.get_status(trace_id)
 
         if cmd == "stop":
-            stop_mode = (payload or {}).get("mode", "graceful")
+            pl = payload or {}
+            stop_mode = pl.get("mode", "graceful")
+            export_path = pl.get("export_path")
+            if isinstance(export_path, str):
+                export_path = export_path.strip() or None
+            else:
+                export_path = None
             self._interrupt_requests[trace_id] = InterruptRequest(
-                command="stop", mode=stop_mode
+                command="stop", mode=stop_mode, export_path=export_path
             )
             state.transition_to(RunState.CANCELLED, "User command: stop")
             self.index_store.update_run_state(trace_id, "CANCELLED")
@@ -873,32 +880,32 @@ class Orchestrator:
                         stage_verdict_fix_override = None
                         if isinstance(results, ExecutionOutcome) and results.interrupted is not None:
                             outcome = results
-                            gate_snapshot_interrupt = self._build_gate_snapshot(
-                                outcome.results, gate
-                            )
-                            mid_extra: dict[str, Any] = {
-                                "runbook_id": runbook_id,
-                                "metadata": metadata,
-                                "stage_id": stage.stage_id,
-                                "stage_index": stage_index,
-                                "pending_node_ids": outcome.pending,
-                                "plan_id": graph.metadata.plan_id,
-                                "stage_retry_count": stage_retry_count,
-                                "gate_snapshot": gate_snapshot_interrupt,
-                                "completed_node_results": {
-                                    nid: out.model_dump(mode="json")
-                                    for nid, out in outcome.results.items()
-                                },
-                                "planned_graph": graph.model_dump(mode="json"),
-                            }
-                            self._write_phase_checkpoint(
-                                state,
-                                recorder,
-                                iteration,
-                                "paused_mid_execute",
-                                extra=mid_extra,
-                            )
                             if outcome.interrupted.command == "pause":
+                                gate_snapshot_interrupt = self._build_gate_snapshot(
+                                    outcome.results, gate
+                                )
+                                mid_extra = {
+                                    "runbook_id": runbook_id,
+                                    "metadata": metadata,
+                                    "stage_id": stage.stage_id,
+                                    "stage_index": stage_index,
+                                    "pending_node_ids": outcome.pending,
+                                    "plan_id": graph.metadata.plan_id,
+                                    "stage_retry_count": stage_retry_count,
+                                    "gate_snapshot": gate_snapshot_interrupt,
+                                    "completed_node_results": {
+                                        nid: out.model_dump(mode="json")
+                                        for nid, out in outcome.results.items()
+                                    },
+                                    "planned_graph": graph.model_dump(mode="json"),
+                                }
+                                self._write_phase_checkpoint(
+                                    state,
+                                    recorder,
+                                    iteration,
+                                    "paused_mid_execute",
+                                    extra=mid_extra,
+                                )
                                 state.transition_to(
                                     RunState.PAUSED,
                                     "User command: pause (mid-execution)",
@@ -910,6 +917,49 @@ class Orchestrator:
                                     recorder, state, "pause", {}
                                 )
                             else:
+                                # stop: graceful = full checkpoint, immediate = minimal
+                                if outcome.interrupted.mode == "graceful":
+                                    gate_snapshot_interrupt = self._build_gate_snapshot(
+                                        outcome.results, gate
+                                    )
+                                    mid_extra = {
+                                        "runbook_id": runbook_id,
+                                        "metadata": metadata,
+                                        "stage_id": stage.stage_id,
+                                        "stage_index": stage_index,
+                                        "pending_node_ids": outcome.pending,
+                                        "plan_id": graph.metadata.plan_id,
+                                        "stage_retry_count": stage_retry_count,
+                                        "gate_snapshot": gate_snapshot_interrupt,
+                                        "completed_node_results": {
+                                            nid: out.model_dump(mode="json")
+                                            for nid, out in outcome.results.items()
+                                        },
+                                        "planned_graph": graph.model_dump(mode="json"),
+                                    }
+                                    self._write_phase_checkpoint(
+                                        state,
+                                        recorder,
+                                        iteration,
+                                        "paused_mid_execute",
+                                        extra=mid_extra,
+                                    )
+                                else:
+                                    mid_extra_minimal = {
+                                        "runbook_id": runbook_id,
+                                        "metadata": metadata,
+                                        "stage_id": stage.stage_id,
+                                        "stage_index": stage_index,
+                                        "plan_id": graph.metadata.plan_id,
+                                        "stage_retry_count": stage_retry_count,
+                                    }
+                                    self._write_phase_checkpoint(
+                                        state,
+                                        recorder,
+                                        iteration,
+                                        "cancelled_mid_execute",
+                                        extra=mid_extra_minimal,
+                                    )
                                 state.transition_to(
                                     RunState.CANCELLED,
                                     "User command: stop (mid-execution)",
@@ -918,8 +968,31 @@ class Orchestrator:
                                     state.trace_id, "CANCELLED"
                                 )
                                 self._record_control_decision(
-                                    recorder, state, "stop", {}
+                                    recorder, state, "stop",
+                                    {"mode": outcome.interrupted.mode},
                                 )
+                                export_path = outcome.interrupted.export_path
+                                if export_path:
+                                    events = list(
+                                        self.index_store.get_trace_events(
+                                            state.trace_id
+                                        )
+                                    )
+                                    fmt = "jsonl"
+                                    if export_path.endswith(".json"):
+                                        fmt = "json"
+                                    elif export_path.endswith(".zip"):
+                                        fmt = "zip"
+                                    try:
+                                        TraceExporter().export(
+                                            events, export_path, fmt=fmt
+                                        )
+                                    except Exception as e:  # noqa: BLE001
+                                        logger.warning(
+                                            "Trace export on stop failed: %s",
+                                            e,
+                                            exc_info=True,
+                                        )
                             self._interrupt_requests.pop(state.trace_id, None)
                             return
                         if isinstance(results, ExecutionOutcome):

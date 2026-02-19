@@ -53,6 +53,8 @@ class InterruptRequest(BaseModel):
     Used by orchestrator and executor to agree on interrupt semantics.
     For pause, mode is effectively always graceful per spec §9.1.2.
     For stop, mode selects graceful (wait for checkpoints) vs immediate (abort).
+    v1: immediate does not cancel in-flight nodes; executor exits after current
+    batch (same as graceful). Difference is checkpoint size only.
     """
 
     command: Literal["pause", "stop"]
