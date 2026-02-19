@@ -41,6 +41,7 @@ PHASE_BOUNDARIES = frozenset({
     "after_control_iter2",
     "final",
     "paused",
+    "paused_mid_execute",
 })
 """Valid phase-boundary labels that support resume."""
 

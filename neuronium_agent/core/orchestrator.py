@@ -18,7 +18,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Union
 
 from neuronium_agent._canonical import canonical_json, artifact_id, canonical_bytes
 from neuronium_agent.artifacts.local_index import LocalArtifactIndex, LocalIndexEntry
@@ -40,6 +40,7 @@ from neuronium_agent.core.state import (
     RunState,
 )
 from neuronium_agent.execution.executor import DAGExecutor
+from neuronium_agent.execution.outcome import ExecutionOutcome
 from neuronium_agent.nodes.base import BaseNode, NodeOutput
 from neuronium_agent.nodes.code_node import CodeNode
 from neuronium_agent.nodes.mcp_node import McpToolNode
@@ -81,7 +82,7 @@ from neuronium_agent.recovery import (
     compute_rollback_scope,
     decide_recovery,
 )
-from neuronium_agent.types import ControlCommand, RunHandle, RunRequest, RunStatus
+from neuronium_agent.types import ControlCommand, InterruptRequest, RunHandle, RunRequest, RunStatus
 from neuronium_agent.verification.demo_critic import (
     DemoCriticVerdict,
     parse_critic_verdict,
@@ -112,6 +113,7 @@ class Orchestrator:
         self._memory_store: Any | None = None  # lazy init
         self._operator_catalog = OperatorCatalog.default()
         self._trace_event_listener = trace_event_listener
+        self._interrupt_requests: dict[str, InterruptRequest | None] = {}
 
     # ------------------------------------------------------------------
     # Public
@@ -366,6 +368,9 @@ class Orchestrator:
         payload = command.payload
 
         if cmd == "pause":
+            self._interrupt_requests[trace_id] = InterruptRequest(
+                command="pause", mode="graceful"
+            )
             state.transition_to(RunState.PAUSED, "User command: pause")
             self.index_store.update_run_state(trace_id, "PAUSED")
             self._record_control_decision(recorder, state, cmd, payload)
@@ -378,6 +383,10 @@ class Orchestrator:
             return self.get_status(trace_id)
 
         if cmd == "stop":
+            stop_mode = (payload or {}).get("mode", "graceful")
+            self._interrupt_requests[trace_id] = InterruptRequest(
+                command="stop", mode=stop_mode
+            )
             state.transition_to(RunState.CANCELLED, "User command: stop")
             self.index_store.update_run_state(trace_id, "CANCELLED")
             self._record_control_decision(recorder, state, cmd, payload)
@@ -612,6 +621,7 @@ class Orchestrator:
         phases within a stage) are skipped based on the checkpoint
         boundary and gate snapshot.
         """
+        self._interrupt_requests.pop(state.trace_id, None)
         try:
             # Strict-fail preflight
             if replay_provider is None and not self._llm_available():
@@ -843,6 +853,62 @@ class Orchestrator:
                             ),
                         )
                         stage_verdict_fix_override = None
+                        if isinstance(results, ExecutionOutcome) and results.interrupted is not None:
+                            outcome = results
+                            gate_snapshot_interrupt = self._build_gate_snapshot(
+                                outcome.results, gate
+                            )
+                            mid_extra: dict[str, Any] = {
+                                "runbook_id": runbook_id,
+                                "metadata": metadata,
+                                "stage_id": stage.stage_id,
+                                "stage_index": stage_index,
+                                "pending_node_ids": outcome.pending,
+                                "plan_id": graph.metadata.plan_id,
+                                "stage_retry_count": stage_retry_count,
+                                "gate_snapshot": gate_snapshot_interrupt,
+                                "completed_node_results": {
+                                    nid: out.model_dump(mode="json")
+                                    for nid, out in outcome.results.items()
+                                },
+                            }
+                            if stage.dynamic_planner is not None:
+                                mid_extra["planned_graph"] = graph.model_dump(
+                                    mode="json"
+                                )
+                            self._write_phase_checkpoint(
+                                state,
+                                recorder,
+                                iteration,
+                                "paused_mid_execute",
+                                extra=mid_extra,
+                            )
+                            if outcome.interrupted.command == "pause":
+                                state.transition_to(
+                                    RunState.PAUSED,
+                                    "User command: pause (mid-execution)",
+                                )
+                                self.index_store.update_run_state(
+                                    state.trace_id, "PAUSED"
+                                )
+                                self._record_control_decision(
+                                    recorder, state, "pause", {}
+                                )
+                            else:
+                                state.transition_to(
+                                    RunState.CANCELLED,
+                                    "User command: stop (mid-execution)",
+                                )
+                                self.index_store.update_run_state(
+                                    state.trace_id, "CANCELLED"
+                                )
+                                self._record_control_decision(
+                                    recorder, state, "stop", {}
+                                )
+                            self._interrupt_requests.pop(state.trace_id, None)
+                            return
+                        if isinstance(results, ExecutionOutcome):
+                            results = results.results
                         gate_snapshot = self._build_gate_snapshot(results, gate)
                         self._write_phase_checkpoint(
                             state, recorder, iteration,
@@ -1561,24 +1627,30 @@ class Orchestrator:
             decision_type=DecisionType.PLANNING,
         )
 
-        backend = get_planner_backend(spec.backend_name)
-        result = backend.plan(
-            request=request,
-            execute_graph=lambda graph, initial_inputs, suppress_node_events: self._execute(
+        def execute_graph(
+            graph: ActionGraph,
+            initial_inputs: dict[str, Any],
+            suppress_node_events: bool,
+        ) -> dict[str, NodeOutput]:
+            raw = self._execute(
                 state,
                 graph,
                 recorder,
                 replay_provider=replay_provider,
                 initial_inputs_override=initial_inputs,
-                # Planner backends may request suppression for noisy internal graphs
-                # (extraction/clarification). However, if a trace event listener is
-                # attached (e.g. CLI live timeline), show all node lifecycle events
-                # to avoid "silent" long waits in COMMIT.
                 suppress_node_events=(
                     suppress_node_events and self._trace_event_listener is None
                 ),
                 stage_default_model_id=stage_default_model_id,
-            ),
+            )
+            if isinstance(raw, ExecutionOutcome):
+                return raw.results
+            return raw
+
+        backend = get_planner_backend(spec.backend_name)
+        result = backend.plan(
+            request=request,
+            execute_graph=execute_graph,
         )
         if isinstance(result, PlannerEscalation):
             final_escalation = PlannerEscalation(
@@ -1720,8 +1792,12 @@ class Orchestrator:
         initial_inputs_override: dict[str, Any] | None = None,
         suppress_node_events: bool = False,
         stage_default_model_id: str | None = None,
-    ) -> dict[str, NodeOutput]:
-        """Build node registry and execute the DAG."""
+    ) -> Union[dict[str, NodeOutput], ExecutionOutcome]:
+        """Build node registry and execute the DAG.
+
+        When interrupt_check is used (v1: always), returns ExecutionOutcome;
+        otherwise returns dict of node results. Caller must handle both.
+        """
         registry = self._build_node_registry(
             graph, stage_default_model_id=stage_default_model_id
         )
@@ -1745,6 +1821,9 @@ class Orchestrator:
                 return
             recorder.record(kind, payload)
 
+        def interrupt_check() -> InterruptRequest | None:
+            return self._interrupt_requests.get(state.trace_id)
+
         executor = DAGExecutor(
             registry,
             max_parallel=self.config.runtime.max_parallel_nodes,
@@ -1752,6 +1831,7 @@ class Orchestrator:
             trace_id=state.trace_id,
             random_seed=self.config.determinism.default_random_seed,
             trace_callback=trace_cb,
+            interrupt_check=interrupt_check,
             max_node_retries=self.config.recovery.max_node_retries,
             retry_backoff_base_seconds=self.config.recovery.retry_backoff_base_seconds,
             retry_count_upgrade_threshold=self.config.recovery.retry_count_upgrade_threshold,
