@@ -1,0 +1,15 @@
+{
+  "inputs": {
+    "objective": "Print the value of x",
+    "constraints": ["Use only stdlib"]
+  },
+  "parameters": {
+    "system_prompt": "You are a Python code generator."
+  },
+  "context": {
+    "execution_id": "exec-001",
+    "trace_id": "abc123def456",
+    "retry_count": 0,
+    "random_seed": 42
+  }
+}

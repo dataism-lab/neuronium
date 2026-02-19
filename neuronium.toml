@@ -1,0 +1,68 @@
+# NEURONIUM Agent — default OSS configuration
+# See CONFIG_SPEC.md for full schema documentation.
+
+[project]
+name = "neuronium"
+data_dir = ".neuronium"
+
+[determinism]
+canonical_json = "neuronium-v1"
+default_random_seed = 0
+llm_temperature = 0.0
+
+[runtime]
+mode = "batch"
+max_parallel_nodes = 4
+checkpoint_policy = "on_transition"
+
+[storage]
+blob_backend = "fs_cas"
+fs_cas_root = ".neuronium/blobs"
+index_backend = "sqlite"
+sqlite_path = ".neuronium/index.sqlite3"
+
+[queue]
+enabled = false
+
+[llm]
+provider = "openai"
+model = "gpt-4.1-mini"
+api_key_env = "NEURONIUM_OPENAI_API_KEY"
+structured_output = true
+timeout_seconds = 60
+max_retries = 2
+
+[mcp]
+enabled = true
+servers = []
+
+[code_node]
+enabled = true
+runtime = "python"
+
+[code_node.docker]
+enabled = true
+image = "python:3.11-slim"
+network_enabled = false
+timeout_seconds = 120
+fs_roots_allowlist = ["./"]
+
+[memory]
+enabled = true
+graphrag_backend = "sqlite"
+
+[memory.semantic_search]
+enabled = false
+backend = "local"
+
+[memory.semantic_search.local]
+enabled = false
+embedding_provider = "sentence_transformers"
+model = "sentence-transformers/all-MiniLM-L6-v2"
+index = "bruteforce"
+store_in_sqlite = true
+
+[logging]
+level = "INFO"
+json = true
+path = ".neuronium/logs/neuronium.jsonl"

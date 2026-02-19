@@ -1,0 +1,10 @@
+{
+  "query": "What were the key revenue drivers last quarter?",
+  "mode": "hybrid",
+  "top_k": 5,
+  "constraints": {
+    "source_kind_filter": ["user_docs"],
+    "confidence_threshold": 0.5
+  },
+  "require_exact_mode": false
+}

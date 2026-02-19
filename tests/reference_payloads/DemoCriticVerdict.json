@@ -1,0 +1,6 @@
+{
+  "verdict": "PASS",
+  "confidence": 0.99,
+  "evidence": ["exit_code=0", "stdout contains '42'"],
+  "gaps": []
+}

@@ -1,0 +1,8 @@
+{
+  "entity_types": [],
+  "relation_types": [],
+  "source_filter": [],
+  "source_kind_filter": ["user_docs"],
+  "visibility_filter": ["user"],
+  "confidence_threshold": 0.5
+}

@@ -1,0 +1,26 @@
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.egg-info/
+.pytest_cache/
+
+# uv.lock
+
+# Virtualenv
+.venv/
+
+# Neuronium runtime data
+.neuronium/
+out.jsonl
+trace.jsonl
+
+.cursor/
+.serena/
+
+docs/internal/

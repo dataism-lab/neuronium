@@ -1,0 +1,30 @@
+{
+  "effective_mode": "hybrid",
+  "warnings": [],
+  "retrieved_chunks": [
+    {
+      "chunk_id": "chunk_001",
+      "text": "Revenue increased by 15% year-over-year.",
+      "source_artifact_id": "sha256:abc123",
+      "metadata": {"source_kind": "user_docs"},
+      "score": 0.92
+    }
+  ],
+  "evidence_refs": [
+    {
+      "chunk_id": "chunk_001",
+      "source_artifact_id": "sha256:abc123",
+      "source_kind": "user_docs",
+      "visibility": "user",
+      "locator": {"source_uri": "docs/report.md"},
+      "quote": "Revenue increased by 15% year-over-year.",
+      "quote_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "relevance_score": 0.92,
+      "confidence": 0.88
+    }
+  ],
+  "stats": {
+    "total_chunks_scanned": 42,
+    "retrieval_time_ms": 12.5
+  }
+}

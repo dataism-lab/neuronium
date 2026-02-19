@@ -1,0 +1,6 @@
+{
+  "objective": "Print the value of x",
+  "constraints": ["Use only stdlib"],
+  "mode": "batch",
+  "metadata": {}
+}

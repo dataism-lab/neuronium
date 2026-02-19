@@ -1,0 +1,13 @@
+{
+  "verdict": "FAIL",
+  "confidence": 0.85,
+  "reasoning": "Code execution failed with NameError",
+  "evidence": [
+    {
+      "source": "execute",
+      "description": "NameError: name 'x' is not defined",
+      "confidence": 1.0
+    }
+  ],
+  "gaps": ["Variable 'x' is not defined before use"]
+}

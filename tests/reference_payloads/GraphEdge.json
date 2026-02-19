@@ -1,0 +1,7 @@
+{
+  "source": "generate",
+  "target": "execute",
+  "edge_type": "data",
+  "label": "generated_code",
+  "condition": null
+}

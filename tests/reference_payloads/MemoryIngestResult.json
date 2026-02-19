@@ -1,0 +1,6 @@
+{
+  "ingested_count": 2,
+  "chunk_ids": ["chunk_001", "chunk_002", "chunk_003"],
+  "source_artifact_ids": ["sha256:abc123", "sha256:def456"],
+  "warnings": []
+}
