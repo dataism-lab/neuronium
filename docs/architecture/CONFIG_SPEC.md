@@ -60,7 +60,7 @@ Binding: конфиг — это **вход** для `create_runner(config)` и 
 - `mcp_allow_non_deterministic_tool_ids: list[str]` (default: `[]`) — при `strict=true` разрешённые идентификаторы MCP-инструментов, считающихся недетерминистичными (allowlist)
 
 ### 2.3 `runtime`
-- `mode: str` (enum: `"batch" | "supervised"`, default: `"batch"`)
+- `mode: str` (enum: `"batch" | "supervised" | "interactive"`, default: `"batch"`)
 - `max_parallel_nodes: int` (default: `4`)
 - `checkpoint_policy: str` (enum: `"on_transition" | "periodic" | "node_boundary"`, default: `"on_transition"`)
 - `checkpoint_interval_seconds: int|null` (default: `null`; используется если policy=`periodic`)

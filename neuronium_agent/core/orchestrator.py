@@ -120,8 +120,18 @@ class Orchestrator:
     # Public
     # ------------------------------------------------------------------
 
-    def start(self, request: RunRequest) -> RunHandle:
-        """Start a new agent run (Commit phase)."""
+    def start(
+        self,
+        request: RunRequest,
+        *,
+        on_handle_ready: Callable[[RunHandle], None] | None = None,
+    ) -> RunHandle:
+        """Start a new agent run (Commit phase).
+
+        If on_handle_ready is provided (e.g. for interactive CLI), it is called
+        with the RunHandle before _run_runbook blocks, so the caller can send
+        control commands (pause/stop) during execution.
+        """
         trace_id = uuid.uuid4().hex
         execution_id = uuid.uuid4().hex
         now = datetime.now(timezone.utc)
@@ -189,6 +199,8 @@ class Orchestrator:
             execution_id=execution_id,
             created_at=now,
         )
+        if on_handle_ready is not None:
+            on_handle_ready(handle)
 
         # Run synchronously (batch mode)
         if get_runbook(runbook_id) is not None:

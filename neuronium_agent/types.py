@@ -17,7 +17,7 @@ class RunRequest(BaseModel):
 
     objective: str
     constraints: list[str] = Field(default_factory=list)
-    mode: Literal["batch", "supervised"] | None = None
+    mode: Literal["batch", "supervised", "interactive"] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

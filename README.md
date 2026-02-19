@@ -70,6 +70,9 @@ neuronium-agent run -o "Write fibonacci" --summary
 # Raw logs for debugging
 neuronium-agent run -o "Write fibonacci" --raw-logs
 
+# Interactive mode: pause/stop during run (Enter or p = pause, q = stop)
+neuronium-agent run -o "Write fibonacci" --mode interactive
+
 # Python API
 from neuronium_agent.api import create_runner
 from neuronium_agent.types import RunRequest
@@ -171,6 +174,7 @@ pytest tests/ -v
 | `neuronium-agent run -o "..." --summary` | Print execution summary after run |
 | `neuronium-agent run -o "..." --raw-logs` | Raw logs instead of timeline |
 | `neuronium-agent run --trace-id ID` | Resume run from checkpoint |
+| `neuronium-agent run -o "..." --mode interactive` | Interactive: pause/stop during run (Enter/p = pause, q = stop; single process only) |
 | `neuronium-agent status --trace-id ID` | Check run status |
 | `neuronium-agent control --trace-id ID --command pause` | Control (continue / pause / revise / replan / stop / escalate) |
 | `neuronium-agent replay --trace-id ID` | Replay (experimental) |

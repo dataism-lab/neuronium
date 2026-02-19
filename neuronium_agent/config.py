@@ -42,7 +42,7 @@ class DeterminismConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
-    mode: Literal["batch", "supervised"] = "batch"
+    mode: Literal["batch", "supervised", "interactive"] = "batch"
     max_parallel_nodes: int = 4
     checkpoint_policy: Literal[
         "on_transition", "periodic", "node_boundary"
