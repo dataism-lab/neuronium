@@ -672,6 +672,7 @@ class Orchestrator:
                 # Phase order: commit → execute → control.
                 # "after_X_iterN" means X is already done — skip it and
                 # all preceding phases.  Generalised for N stages.
+                # paused_mid_execute: commit done (use planned_graph), execute continues from exact pause point.
                 skip_commit = False
                 skip_execute = False
                 skip_control = False
@@ -679,8 +680,12 @@ class Orchestrator:
                     sfx = f"_iter{iteration}"
                     past_commit = {f"after_execute{sfx}", f"after_control{sfx}"}
                     past_control = {f"after_control{sfx}"}
-                    skip_commit = resume_boundary in past_commit
-                    skip_execute = resume_boundary in past_commit
+                    if resume_boundary == "paused_mid_execute":
+                        skip_commit = True
+                        skip_execute = False
+                    else:
+                        skip_commit = resume_boundary in past_commit
+                        skip_execute = resume_boundary in past_commit
                     skip_control = resume_boundary in past_control
 
                 graph = stage.graph
@@ -844,10 +849,23 @@ class Orchestrator:
                         execute_inputs = (stage.initial_inputs_override or {}) | (
                             graph_builder_initial_inputs or {}
                         ) | (stage_verdict_fix_override or {})
+                        initial_node_results: dict[str, NodeOutput] | None = None
+                        if (
+                            resume_ctx
+                            and stage_index == resume_stage_index
+                            and resume_boundary == "paused_mid_execute"
+                        ):
+                            raw = resume_ctx.get("completed_node_results")
+                            if isinstance(raw, dict) and raw:
+                                initial_node_results = {
+                                    nid: NodeOutput.model_validate(payload)
+                                    for nid, payload in raw.items()
+                                }
                         results = self._execute(
                             state, graph, recorder,
                             replay_provider=replay_provider,
                             initial_inputs_override=execute_inputs or None,
+                            initial_node_results=initial_node_results,
                             stage_default_model_id=getattr(
                                 stage, "default_model_id", None
                             ),
@@ -871,11 +889,8 @@ class Orchestrator:
                                     nid: out.model_dump(mode="json")
                                     for nid, out in outcome.results.items()
                                 },
+                                "planned_graph": graph.model_dump(mode="json"),
                             }
-                            if stage.dynamic_planner is not None:
-                                mid_extra["planned_graph"] = graph.model_dump(
-                                    mode="json"
-                                )
                             self._write_phase_checkpoint(
                                 state,
                                 recorder,
@@ -1790,6 +1805,7 @@ class Orchestrator:
         *,
         replay_provider: ReplayProvider | None = None,
         initial_inputs_override: dict[str, Any] | None = None,
+        initial_node_results: dict[str, NodeOutput] | None = None,
         suppress_node_events: bool = False,
         stage_default_model_id: str | None = None,
     ) -> Union[dict[str, NodeOutput], ExecutionOutcome]:
@@ -1797,6 +1813,7 @@ class Orchestrator:
 
         When interrupt_check is used (v1: always), returns ExecutionOutcome;
         otherwise returns dict of node results. Caller must handle both.
+        initial_node_results: optional pre-filled results for resume at exact pause point.
         """
         registry = self._build_node_registry(
             graph, stage_default_model_id=stage_default_model_id
@@ -1865,7 +1882,11 @@ class Orchestrator:
         if initial_inputs_override:
             base_inputs.update(initial_inputs_override)
 
-        results = executor.execute(graph, initial_inputs=base_inputs)
+        results = executor.execute(
+            graph,
+            initial_inputs=base_inputs,
+            initial_results=initial_node_results,
+        )
 
         # Record replay data as trace events
         for nid, recs in recordings.items():

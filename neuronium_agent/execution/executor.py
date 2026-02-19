@@ -81,12 +81,21 @@ class DAGExecutor:
         graph: ActionGraph,
         *,
         initial_inputs: dict[str, Any] | None = None,
+        initial_results: dict[str, NodeOutput] | None = None,
     ) -> Union[dict[str, NodeOutput], ExecutionOutcome]:
         """Run the full DAG and return results or an execution outcome.
 
         Respects conditional branches (B3): when a decision node completes,
         its output branch value is recorded; nodes in unselected branches
         are never added to ready and are skipped.
+
+        Parameters
+        ----------
+        initial_results
+            Optional pre-filled node results (e.g. from a mid-execution
+            checkpoint). When provided, only nodes not in this dict are
+            executed; completed and pending are derived from it (resume
+            at exact pause point per spec §6.4.2).
 
         Return type
         ----------
@@ -113,7 +122,24 @@ class DAGExecutor:
         selected_branches: dict[str, str] = {}
 
         completed: set[str] = set()
-        pending = list(order)
+        pending: list[str]
+        if initial_results:
+            self.results = dict(initial_results)
+            completed = set(initial_results)
+            pending = [nid for nid in order if nid not in initial_results]
+            # Restore selected_branches from completed decision nodes so
+            # nodes in unselected branches stay pruned during resume.
+            for nid, output in initial_results.items():
+                gn = nmap.get(nid)
+                if gn and gn.node_type == "decision" and output.status == "COMPLETED":
+                    branch_key = (gn.parameters or {}).get(
+                        "branch_output_key", BRANCH_OUTPUT_KEY
+                    )
+                    branch_value = output.outputs.get(branch_key)
+                    if branch_value is not None:
+                        selected_branches[nid] = str(branch_value)
+        else:
+            pending = list(order)
 
         while pending:
             # Ready: all predecessors completed and not in an unselected branch

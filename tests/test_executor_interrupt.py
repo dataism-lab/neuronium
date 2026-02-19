@@ -107,3 +107,35 @@ def test_execute_with_interrupt_check_no_trigger_returns_outcome() -> None:
     assert result.results.keys() == {"only"}
     assert result.pending == []
     assert result.interrupted is None
+
+
+def test_execute_with_initial_results_runs_only_pending_nodes() -> None:
+    """With initial_results (resume at exact pause point), only pending nodes are executed."""
+    graph = ActionGraph(
+        metadata=GraphMetadata(plan_id="p1", description=""),
+        nodes=[
+            GraphNode(node_id="a", node_type="model", label="A", priority=0),
+            GraphNode(node_id="b", node_type="model", label="B", priority=0),
+        ],
+        edges=[GraphEdge(source="a", target="b")],
+    )
+    registry = {
+        "a": SimpleNode(node_id="a"),
+        "b": SimpleNode(node_id="b"),
+    }
+    # Pre-fill result for "a" as if we resumed from checkpoint
+    initial_results = {
+        "a": NodeOutput(outputs={"value": "a"}, status="COMPLETED"),
+    }
+    executor = DAGExecutor(
+        registry,
+        execution_id="e1",
+        trace_id="t1",
+        random_seed=0,
+        max_parallel=2,
+    )
+    result = executor.execute(graph, initial_inputs={}, initial_results=initial_results)
+    assert isinstance(result, dict)
+    assert set(result.keys()) == {"a", "b"}
+    assert result["a"].outputs["value"] == "a"
+    assert result["b"].outputs["value"] == "b"
