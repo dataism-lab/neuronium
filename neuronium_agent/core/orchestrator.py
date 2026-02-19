@@ -1572,7 +1572,7 @@ class Orchestrator:
                 initial_inputs_override=initial_inputs,
                 # Planner backends may request suppression for noisy internal graphs
                 # (extraction/clarification). However, if a trace event listener is
-                # attached (e.g. CLI --demo-live), show all node lifecycle events
+                # attached (e.g. CLI live timeline), show all node lifecycle events
                 # to avoid "silent" long waits in COMMIT.
                 suppress_node_events=(
                     suppress_node_events and self._trace_event_listener is None
