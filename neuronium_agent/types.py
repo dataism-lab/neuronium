@@ -47,6 +47,19 @@ class ControlCommand(BaseModel):
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
+class InterruptRequest(BaseModel):
+    """Internal contract for pause/stop (PAUSE_CONTROL_IMPLEMENTATION_PLAN §0.1).
+
+    Used by orchestrator and executor to agree on interrupt semantics.
+    For pause, mode is effectively always graceful per spec §9.1.2.
+    For stop, mode selects graceful (wait for checkpoints) vs immediate (abort).
+    """
+
+    command: Literal["pause", "stop"]
+    mode: Literal["graceful", "immediate"] = "graceful"
+    export_path: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Trace
 # ---------------------------------------------------------------------------

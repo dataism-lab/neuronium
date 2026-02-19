@@ -64,6 +64,8 @@ Binding: конфиг — это **вход** для `create_runner(config)` и 
 - `max_parallel_nodes: int` (default: `4`)
 - `checkpoint_policy: str` (enum: `"on_transition" | "periodic" | "node_boundary"`, default: `"on_transition"`)
 - `checkpoint_interval_seconds: int|null` (default: `null`; используется если policy=`periodic`)
+- `pause_grace_period_seconds: int` (default: `30`) — grace period для паузы: дать активным нодам доработать до checkpoint (Spec §9.1.2)
+- `stop_grace_period_seconds: int` (default: `5`) — grace period для cooperative stop перед принудительным завершением (Spec §6.2.4)
 
 ### 2.4 `storage`
 #### 2.4.1 Blob store (default OSS)
