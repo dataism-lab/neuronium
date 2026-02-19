@@ -66,8 +66,8 @@ def _make_runner(
 
     orig_build = runner._orchestrator._build_node_registry
 
-    def patched_build(graph):
-        registry = orig_build(graph)
+    def patched_build(graph, *, stage_default_model_id=None, **kwargs):
+        registry = orig_build(graph, stage_default_model_id=stage_default_model_id, **kwargs)
         for nid, node in registry.items():
             if hasattr(node, "set_replay_responses") and nid in _DOCS_REPORT_REPLAY:
                 node.set_replay_responses(_DOCS_REPORT_REPLAY[nid])
@@ -137,7 +137,7 @@ class TestStageEvents:
     def test_stage_end_failure_on_critic_fail(
         self, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """When critic returns FAIL, stage_end records success=False."""
+        """When critic returns FAIL, stage_end records success=False; B1 → run goes PAUSED (ESCALATE)."""
         monkeypatch.setenv("NEURONIUM_OPENAI_API_KEY", "test-fake-key")
 
         fail_replay = dict(_DOCS_REPORT_REPLAY)
@@ -166,8 +166,10 @@ class TestStageEvents:
 
         orig_build = runner._orchestrator._build_node_registry
 
-        def patched_build(graph):
-            registry = orig_build(graph)
+        def patched_build(graph, *, stage_default_model_id=None, **kwargs):
+            registry = orig_build(
+                graph, stage_default_model_id=stage_default_model_id, **kwargs
+            )
             for nid, node in registry.items():
                 if hasattr(node, "set_replay_responses") and nid in fail_replay:
                     node.set_replay_responses(fail_replay[nid])
@@ -181,7 +183,8 @@ class TestStageEvents:
         ))
 
         status = runner.get_status(handle)
-        assert status.state == "FAILED"
+        # B1 Part 1: critic FAIL with no node failures → ESCALATE → PAUSED (not FAILED)
+        assert status.state == "PAUSED"
 
         events = list(runner._index.get_trace_events(handle.trace_id))
         stage_ends = [e for e in events if e["kind"] == "stage_end"]

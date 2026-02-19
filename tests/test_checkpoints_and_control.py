@@ -22,6 +22,7 @@ from neuronium_agent.config import AppConfig, StorageConfig, ProjectConfig
 from neuronium_agent.core.state import AgentState, Intention, IntentionPhase, RunState
 from neuronium_agent.storage.fs_cas import FsCasStore
 from neuronium_agent.storage.sqlite_store import SqliteIndexStore
+from neuronium_agent.planning.htn import HTNPlanner
 from neuronium_agent.trace.checkpoints import (
     PHASE_BOUNDARIES,
     CheckpointError,
@@ -147,8 +148,8 @@ def _make_runner(
 
     orig_build = runner._orchestrator._build_node_registry
 
-    def patched_build(graph):
-        registry = orig_build(graph)
+    def patched_build(graph, *, stage_default_model_id=None, **kwargs):
+        registry = orig_build(graph, stage_default_model_id=stage_default_model_id, **kwargs)
         for nid, node in registry.items():
             if hasattr(node, "set_replay_responses") and nid in replay_map:
                 node.set_replay_responses(replay_map[nid])
@@ -189,6 +190,21 @@ class TestCheckpointPayload:
 
         assert ctx["fix_context"] == {"key": "value"}
         assert ctx["added_constraints"] == ["c1"]
+
+    def test_runbook_id_and_metadata_preserved(self, _state: AgentState) -> None:
+        """A2: runbook_id and metadata in extra are preserved in resume_context."""
+        payload = build_checkpoint_payload(
+            _state,
+            iteration=1,
+            phase_boundary="after_execute_iter1",
+            extra={
+                "runbook_id": "docs_report_v1",
+                "metadata": {"doc_paths": ["/tmp/a.md"], "runbook_id": "docs_report_v1"},
+            },
+        )
+        _, ctx = load_state_from_checkpoint(payload)
+        assert ctx["runbook_id"] == "docs_report_v1"
+        assert ctx["metadata"] == {"doc_paths": ["/tmp/a.md"], "runbook_id": "docs_report_v1"}
 
     def test_invalid_boundary_raises(self, _state: AgentState) -> None:
         payload = build_checkpoint_payload(
@@ -238,6 +254,24 @@ class TestPhaseBoundaryCheckpoints:
         # Final checkpoint must be present
         assert "final" in boundaries
 
+    def test_successful_run_has_determinism_audit_event(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """B11: trace contains determinism_audit event (nodes_using_seed, seed_value)."""
+        runner = _make_runner(tmp_dir, monkeypatch, _ITER1_PASS)
+        handle = runner.start(RunRequest(objective="Determinism audit test"))
+
+        events = list(runner._index.get_trace_events(handle.trace_id))
+        audit_events = [e for e in events if e.get("kind") == "determinism_audit"]
+
+        assert len(audit_events) >= 1, "At least one determinism_audit event expected"
+        payload = audit_events[0].get("payload", {})
+        assert "nodes_using_seed" in payload
+        assert "seed_value" in payload
+        assert payload.get("seed_present") is True
+
     def test_checkpoints_have_valid_boundaries(
         self,
         tmp_dir: Path,
@@ -254,6 +288,31 @@ class TestPhaseBoundaryCheckpoints:
             assert boundary in PHASE_BOUNDARIES, (
                 "Unexpected boundary: " + str(boundary)
             )
+
+    def test_checkpoints_contain_runbook_id_and_metadata(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A2: every phase-boundary checkpoint includes runbook_id and metadata."""
+        runner = _make_runner(tmp_dir, monkeypatch, _ITER1_PASS)
+        custom_metadata = {"runbook_id": "autofix_demo", "custom_key": "custom_value"}
+        handle = runner.start(RunRequest(
+            objective="A2 checkpoint metadata test",
+            metadata=custom_metadata,
+        ))
+
+        events = list(runner._index.get_trace_events(handle.trace_id))
+        cp_events = [e for e in events if e["kind"] == "checkpoint"]
+        assert len(cp_events) >= 1
+
+        for cp in cp_events:
+            rc = cp["payload"].get("resume_context", {})
+            assert "runbook_id" in rc, "Checkpoint must have runbook_id in resume_context"
+            assert rc["runbook_id"] == "autofix_demo"
+            assert "metadata" in rc, "Checkpoint must have metadata in resume_context"
+            assert isinstance(rc["metadata"], dict)
+            assert rc["metadata"].get("custom_key") == "custom_value"
 
 
 # ===================================================================
@@ -652,3 +711,73 @@ class TestResumeFromCheckpoint:
 
         with pytest.raises(CheckpointError, match="No phase-boundary checkpoint"):
             runner.resume_run("resume-test-2")
+
+    def test_resume_backward_compatible_without_runbook_id_and_metadata(
+        self,
+        tmp_dir: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A2: resume from old checkpoint (no runbook_id/metadata in resume_context) still works."""
+        runner = _make_runner(tmp_dir, monkeypatch, _ITER1_PASS)
+        trace_id = "resume-old-format"
+        runner._index.upsert_run(
+            trace_id=trace_id,
+            execution_id="exec-old",
+            state="RUNNING",
+            objective="Old format resume",
+            config_snapshot_json="{}",
+            created_at=datetime.now(timezone.utc).isoformat(),
+        )
+        # Decision so _infer_runbook_id finds runbook_id
+        runner._index.append_trace_event(
+            trace_id,
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "kind": "decision",
+                "payload": {"description": "Runbook selected", "runbook_id": "autofix_demo"},
+            },
+        )
+        # Old-format checkpoint: no runbook_id, no metadata in resume_context.
+        # Use iteration=2, after_control_iter2 so resume skips to end without running nodes.
+        # Stage 2 has graph_builder so we must include planned_graph for resume to succeed.
+        planner = HTNPlanner()
+        iter2_graph = planner.plan_iter2_fix(
+            "Old format resume", [], fix_context={"fix_context": "minimal"},
+        )
+        state = AgentState(
+            trace_id=trace_id,
+            execution_id="exec-old",
+            run_state=RunState.RUNNING,
+            intention=Intention(
+                intention_id="int-old",
+                objective="Old format resume",
+                phase=IntentionPhase.EXECUTE,
+                plan_id=iter2_graph.metadata.plan_id,
+            ),
+        )
+        cp_payload = build_checkpoint_payload(
+            state,
+            iteration=2,
+            phase_boundary="after_control_iter2",
+            extra={
+                "stage_id": "autofix_demo:iter2",
+                "stage_index": 1,
+                "planned_graph": iter2_graph.model_dump(mode="json"),
+                "gate_snapshot": {
+                    "required_nodes_ok": True,
+                    "critic_verdict": "PASS",
+                    "critic_confidence": 0.9,
+                    "critic_evidence": ["resume backward compat"],
+                    "critic_gaps": [],
+                },
+            },
+        )
+        runner._index.append_trace_event(
+            trace_id,
+            {"ts": datetime.now(timezone.utc).isoformat(), "kind": "checkpoint", "payload": cp_payload},
+        )
+
+        handle = runner.resume_run(trace_id)
+        status = runner.get_status(handle)
+        # Resume should succeed using _infer_runbook_id and _infer_runbook_metadata
+        assert status.state == "COMPLETED"

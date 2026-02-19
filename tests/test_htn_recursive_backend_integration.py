@@ -85,8 +85,8 @@ def _make_runner(
 
     orig_build = runner._orchestrator._build_node_registry
 
-    def patched_build(graph):
-        registry = orig_build(graph)
+    def patched_build(graph, *, stage_default_model_id=None, **kwargs):
+        registry = orig_build(graph, stage_default_model_id=stage_default_model_id, **kwargs)
         for nid, node in registry.items():
             if hasattr(node, "set_replay_responses") and nid in _REPLAY_MAP:
                 node.set_replay_responses(_REPLAY_MAP[nid])

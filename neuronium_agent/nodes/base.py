@@ -11,6 +11,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from neuronium_agent.types import FailureClass
+
+from neuronium_agent.nodes.determinism import DeterminismContract
+
 
 # ---------------------------------------------------------------------------
 # I/O contracts
@@ -51,6 +55,7 @@ class NodeOutput(BaseModel):
         "COMPLETED", "FAILED", "TIMEOUT"
     ] = "COMPLETED"
     error: str | None = None
+    failure_class: FailureClass | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -69,6 +74,11 @@ class BaseNode(ABC):
     @abstractmethod
     def execute(self, node_input: NodeInput) -> NodeOutput:
         """Execute the node logic and return output."""
+
+    def get_determinism_contract(self) -> DeterminismContract:
+        """Declare determinism: uses_seed and declared_non_deterministic.
+        Override in subclasses (ModelNode, CodeNode, McpToolNode)."""
+        return DeterminismContract(uses_seed=False, declared_non_deterministic=False)
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} id={self.node_id!r}>"

@@ -150,7 +150,8 @@ def test_web_extract_article_via_mcp_tool_node() -> None:
     ))
     assert out.status == "COMPLETED"
     assert "Hello world" in out.outputs["text"]
-    assert out.outputs["images"][0]["src"] == "https://x.test/a.png"
+    # Relative a.png resolved against document URL (with path /base) → /base/a.png
+    assert out.outputs["images"][0]["src"] == "https://x.test/base/a.png"
 
 
 def test_web_extract_article_via_mcp_tool_node_accepts_html_from_node_inputs() -> None:

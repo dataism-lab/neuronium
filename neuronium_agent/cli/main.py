@@ -46,6 +46,8 @@ def _interactive_supervised_loop(
     """Handle PAUSED clarification flow in supervised mode."""
     status = runner.get_status(handle)
     while status.state == "PAUSED":
+        # Ensure DB state is RUNNING before resume_run (resume requires it).
+        runner.control(handle, ControlCommand(type="continue", payload={}))  # type: ignore[arg-type]
         pause_context = runner.get_latest_pause_context(handle.trace_id)
         if not pause_context:
             break
@@ -61,12 +63,36 @@ def _interactive_supervised_loop(
             questions = []
 
         click.echo("Run paused: требуется уточнение входных параметров.")
+        # Optional bulk JSON shortcut (fast paste), but default UX is per-question.
+        parsed: dict[str, object] = {}
+        if len(questions) >= 2:
+            click.echo("Можно вставить JSON-объект с ответами (Enter чтобы отвечать по одному).")
+            click.echo('Пример: {"url":"https://...","doc_paths":["a.md","b.md"]}')
+            raw = click.prompt("answers_json (optional)", default="", show_default=False).strip()
+            if raw:
+                try:
+                    obj = json.loads(raw)
+                    if isinstance(obj, dict):
+                        parsed = obj
+                except Exception:
+                    parsed = {}
+
         answers: dict[str, object] = {}
+        # 1) Apply any parsed bulk answers (only for known keys)
+        if parsed:
+            for q in questions:
+                if not isinstance(q, dict):
+                    continue
+                key = str(q.get("key", "")).strip()
+                if key and key in parsed:
+                    answers[key] = parsed[key]
+
+        # 2) Ask remaining questions one-by-one
         for q in questions:
             if not isinstance(q, dict):
                 continue
             key = str(q.get("key", "")).strip()
-            if not key:
+            if not key or key in answers:
                 continue
             prompt = str(q.get("prompt", key)).strip() or key
             answer = click.prompt(prompt, default="", show_default=False).strip()
@@ -82,11 +108,42 @@ def _interactive_supervised_loop(
             "answers": answers,
         }
         runner.control(handle, ControlCommand(type="revise", payload=payload))  # type: ignore[arg-type]
-        runner.control(handle, ControlCommand(type="continue", payload={}))  # type: ignore[arg-type]
         handle = runner.resume_run(handle.trace_id)
         status = runner.get_status(handle)
 
     return handle, status
+
+
+def _print_pause_help(runner: AgentRunner, trace_id: str) -> None:
+    """Best-effort print clarification questions when a run is PAUSED."""
+    pause_context = runner.get_latest_pause_context(trace_id)
+    if not pause_context:
+        return
+    request_artifact_id = str(
+        pause_context.get("clarification_request_artifact_id", "")
+    ).strip()
+    if not request_artifact_id:
+        return
+    try:
+        clarification = runner.read_artifact_json(request_artifact_id)
+    except Exception:
+        return
+    questions = clarification.get("questions", [])
+    if not isinstance(questions, list) or not questions:
+        return
+    click.echo("")
+    click.echo("PAUSED: требуется уточнение параметров.")
+    click.echo("Вопросы:")
+    for q in questions:
+        if not isinstance(q, dict):
+            continue
+        key = str(q.get("key", "")).strip()
+        prompt = str(q.get("prompt", "")).strip()
+        if key and prompt:
+            click.echo(f"- {key}: {prompt}")
+    click.echo("")
+    click.echo("Чтобы ответить интерактивно, запусти:")
+    click.echo(f"  neuronium-agent run --mode supervised --trace-id {trace_id}")
 
 
 def _extract_latest_plan_payload(events: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -237,6 +294,32 @@ def _preview_url(value: Any, *, max_len: int = 120) -> str:
     return raw[:max_len] + "..."
 
 
+def _preview_io(value: Any, *, max_len: int = 160) -> str:
+    """Preview stdout/stderr safely for demo logs (single-line, truncated)."""
+    if value is None:
+        return ""
+    text = str(value)
+    # Keep it single-line for console, preserve intent.
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "\\n")
+    text = text.strip()
+    if len(text) > max_len:
+        return text[:max_len] + "..."
+    return text
+
+
+def _extract_best_effort_critic_summary(outputs: dict[str, Any]) -> str | None:
+    """Extract a compact verdict summary from critic-like model outputs."""
+    parsed = outputs.get("parsed")
+    if isinstance(parsed, dict) and isinstance(parsed.get("verdict"), str):
+        verdict = str(parsed.get("verdict", "UNCERTAIN")).strip() or "UNCERTAIN"
+        conf = parsed.get("confidence", None)
+        evidence = parsed.get("evidence", [])
+        ev_n = len(evidence) if isinstance(evidence, list) else 0
+        conf_sfx = f" conf={conf}" if isinstance(conf, (int, float)) else ""
+        return f"{verdict}{conf_sfx} evidence={ev_n}"
+    return None
+
+
 def _human_step_title(*, node_id: str, node_type: str, tool_name: str | None) -> str:
     nid = node_id.strip().lower()
     tname = (tool_name or "").strip().lower()
@@ -355,6 +438,22 @@ def _extract_demo_timeline_steps(
             content = outputs.get("content")
             if isinstance(content, str) and content:
                 detail_parts.append(f"chars={len(content)}")
+            critic_summary = _extract_best_effort_critic_summary(outputs)
+            if critic_summary:
+                detail_parts.append(f"critic={critic_summary}")
+        elif node_type == "code":
+            runner = outputs.get("runner")
+            if isinstance(runner, str) and runner.strip():
+                detail_parts.append(f"runner={runner.strip()}")
+            exit_code = outputs.get("exit_code")
+            if isinstance(exit_code, (int, str)):
+                detail_parts.append(f"exit={exit_code}")
+            stdout = outputs.get("stdout")
+            if isinstance(stdout, str) and stdout.strip():
+                detail_parts.append(f'stdout="{_preview_io(stdout, max_len=90)}"')
+            stderr = outputs.get("stderr")
+            if isinstance(stderr, str) and stderr.strip():
+                detail_parts.append(f'stderr="{_preview_io(stderr, max_len=90)}"')
 
         details = (" — " + " ".join(detail_parts)) if detail_parts else ""
         steps.append(f"EXECUTE: {title}{elapsed_part} [{status}]{details}")
@@ -364,7 +463,7 @@ def _extract_demo_timeline_steps(
     return steps
 
 
-def _build_live_demo_listener() -> Callable[[dict[str, Any]], None]:
+def _build_live_demo_listener(*, verbose: bool = False) -> Callable[[dict[str, Any]], None]:
     """Return a trace event listener that prints demo timeline lines live."""
     node_types: dict[str, str] = {}
     node_parameters: dict[str, dict[str, Any]] = {}
@@ -373,6 +472,30 @@ def _build_live_demo_listener() -> Callable[[dict[str, Any]], None]:
         kind = ev.get("kind")
         payload = ev.get("payload", {})
         if not isinstance(payload, dict):
+            return
+
+        if kind == "critic_verdict":
+            verdict = str(payload.get("verdict", "UNCERTAIN")).strip() or "UNCERTAIN"
+            conf = payload.get("confidence", None)
+            evidence = payload.get("evidence", [])
+            ev_n = len(evidence) if isinstance(evidence, list) else 0
+            conf_sfx = f"{conf:.2f}" if isinstance(conf, (int, float)) else "n/a"
+            click.echo(f"CONTROL: critic_verdict={verdict} conf={conf_sfx} evidence={ev_n}")
+            if verbose and isinstance(evidence, list) and evidence:
+                preview = "; ".join(_preview_text(x, max_len=80) for x in evidence[:2])
+                click.echo(f"CONTROL: evidence: {preview}")
+            return
+
+        if kind == "replan":
+            reason = str(payload.get("reason", "")).strip() or "n/a"
+            it_from = payload.get("iteration_from", "?")
+            it_to = payload.get("iteration_to", "?")
+            added = payload.get("added_constraints", [])
+            n_added = len(added) if isinstance(added, list) else 0
+            click.echo(f"ADAPT: replan iter{it_from}->iter{it_to} reason={reason} added_constraints={n_added}")
+            if verbose and isinstance(added, list) and added:
+                preview = "; ".join(_preview_text(x, max_len=90) for x in added[:2])
+                click.echo(f"ADAPT: constraints: {preview}")
             return
 
         if kind == "checkpoint":
@@ -399,6 +522,10 @@ def _build_live_demo_listener() -> Callable[[dict[str, Any]], None]:
                 n = len(nodes) if isinstance(nodes, list) else 0
                 e = len(edges) if isinstance(edges, list) else 0
                 click.echo(f"PLAN: runtime DAG built (nodes={n}, edges={e})")
+            if desc == "Local rendered artifact saved":
+                artifact_path = str(payload.get("artifact_path", "")).strip()
+                if artifact_path:
+                    click.echo(f'OUTPUT: rendered_html="{artifact_path}"')
             return
 
         if kind == "node_start":
@@ -455,6 +582,26 @@ def _build_live_demo_listener() -> Callable[[dict[str, Any]], None]:
             content = outputs.get("content")
             if isinstance(content, str) and content:
                 detail_parts.append(f"chars={len(content)}")
+                if verbose and node_id in {"generate", "fix"}:
+                    detail_parts.append(f'code="{_preview_io(content, max_len=90)}"')
+            critic_summary = _extract_best_effort_critic_summary(outputs)
+            if critic_summary:
+                detail_parts.append(f"critic={critic_summary}")
+        elif node_type == "code":
+            runner = outputs.get("runner")
+            if isinstance(runner, str) and runner.strip():
+                detail_parts.append(f"runner={runner.strip()}")
+            exit_code = outputs.get("exit_code")
+            if isinstance(exit_code, (int, str)):
+                detail_parts.append(f"exit={exit_code}")
+            stdout = outputs.get("stdout")
+            if isinstance(stdout, str) and stdout.strip():
+                detail_parts.append(f'stdout="{_preview_io(stdout, max_len=90)}"')
+            stderr = outputs.get("stderr")
+            if isinstance(stderr, str) and stderr.strip():
+                detail_parts.append(f'stderr="{_preview_io(stderr, max_len=90)}"')
+            if verbose and isinstance(payload.get("error"), str) and payload.get("error", "").strip():
+                detail_parts.append(f'error="{_preview_text(payload.get("error"), max_len=90)}"')
 
         details = (" — " + " ".join(detail_parts)) if detail_parts else ""
         click.echo(f"EXECUTE: {title}{elapsed_part} [{status}]{details}")
@@ -684,6 +831,27 @@ def cli() -> None:
     show_default=True,
     help="Print demo timeline live during execution (human-readable)",
 )
+@click.option(
+    "--demo-verbose/--no-demo-verbose",
+    "demo_verbose",
+    default=False,
+    show_default=True,
+    help="Increase demo timeline verbosity (stdout/stderr previews, critic summaries)",
+)
+@click.option(
+    "--autofix-inject-bug/--no-autofix-inject-bug",
+    "autofix_inject_bug",
+    default=False,
+    show_default=True,
+    help="For autofix_demo: inject a deliberate runtime bug in iter1 to reliably trigger iter2 fix (demo only)",
+)
+@click.option(
+    "--auto-clarify/--no-auto-clarify",
+    "auto_clarify",
+    default=True,
+    show_default=True,
+    help="If the run pauses for clarification, ask questions immediately in the same process (interactive terminals only)",
+)
 def run(
     objective: str | None,
     resume_trace_id: str | None,
@@ -693,6 +861,9 @@ def run(
     trace_export: str | None,
     demo_report: bool,
     demo_live: bool,
+    demo_verbose: bool,
+    autofix_inject_bug: bool,
+    auto_clarify: bool,
 ) -> None:
     """Start a new agent run or resume an existing one.
 
@@ -710,21 +881,31 @@ def run(
     else:
         _setup_logging(config.logging.level, config.logging.json_logs)
 
-    listener = _build_live_demo_listener() if demo_live else None
+    listener = _build_live_demo_listener(verbose=demo_verbose) if demo_live else None
     runner = create_runner(config, trace_event_listener=listener)
 
     if resume_trace_id:
-        # Resume path
+        # Resume path:
+        # - If PAUSED and in supervised mode, run interactive loop which will
+        #   send revise+continue and then resume.
+        # - If RUNNING, resume immediately.
+        # - Otherwise, print status and helpful next-step hints.
         click.echo(f"Resuming run: trace_id={resume_trace_id}")
-        try:
-            handle = runner.resume_run(resume_trace_id)
-        except Exception as exc:
-            click.echo(f"Resume failed: {exc}", err=True)
-            sys.exit(1)
+        from datetime import datetime, timezone
+
+        handle = RunHandle(
+            trace_id=resume_trace_id,
+            execution_id="",
+            created_at=datetime.now(timezone.utc),
+        )
     elif objective:
         # New run path
+        constraints: list[str] = []
+        if autofix_inject_bug and runbook_id == "autofix_demo":
+            constraints.append("__NEURONIUM_INTERNAL_DEMO_INJECT_BUG__")
         request = RunRequest(  # type: ignore[arg-type]
             objective=objective,
+            constraints=constraints,
             mode=mode,
             metadata={"runbook_id": runbook_id},
         )
@@ -735,13 +916,31 @@ def run(
         sys.exit(1)
 
     status = runner.get_status(handle)
+
+    # For resume runs, if state is RUNNING and we are not in supervised
+    # clarification flow, resume immediately.
+    if resume_trace_id and status.state == "RUNNING" and config.runtime.mode != "supervised":
+        try:
+            handle = runner.resume_run(handle.trace_id)
+            status = runner.get_status(handle)
+        except Exception as exc:
+            click.echo(f"Resume failed: {exc}", err=True)
+            sys.exit(1)
+
     if config.runtime.mode == "supervised":
+        # Supervised mode handles PAUSED clarification and then resumes.
+        # If the run isn't paused, it will just return current status.
+        handle, status = _interactive_supervised_loop(runner, handle)
+    elif auto_clarify and status.state == "PAUSED" and sys.stdin.isatty() and sys.stdout.isatty():
+        # Auto-clarify even in batch mode to avoid requiring a second CLI command.
         handle, status = _interactive_supervised_loop(runner, handle)
 
     click.echo(f"trace_id: {handle.trace_id}")
     click.echo(f"state:    {status.state}")
     if status.message:
         click.echo(f"message:  {status.message}")
+    if status.state == "PAUSED" and config.runtime.mode != "supervised":
+        _print_pause_help(runner, handle.trace_id)
 
     if trace_export:
         fmt = "jsonl"

@@ -67,6 +67,7 @@ Index:
 - `blob_key TEXT NOT NULL` (для FS CAS = относительный путь или `artifact_id`)
 - `media_type TEXT NOT NULL`
 - `size_bytes INTEGER NOT NULL`
+- `deprecated_at TEXT NULL` (логическое устаревание при rollback; добавляется миграцией 0002)
 
 Index:
 - `idx_artifacts_created_at(created_at)`
@@ -184,8 +185,8 @@ Local embeddings backend в production допускается, но по умо�
 В v1 используется **встроенный мигратор** без тяжёлых зависимостей:
 - `schema_version` хранит текущую версию
 - миграции — это последовательные SQL файлы:
-  - `neuronium_agent/storage/migrations/sqlite/0001_init.sql`
-  - `neuronium_agent/storage/migrations/postgres/0001_init.sql`
+  - `neuronium_agent/storage/migrations/sqlite/0001_init.sql`, `0002_artifact_deprecated_at.sql`
+  - `neuronium_agent/storage/migrations/postgres/0001_init.sql`, `0002_artifact_deprecated_at.sql`
 
 ### 4.2 Правила
 - миграции **идемпотентны** (или гарантировано применяются один раз по версии)

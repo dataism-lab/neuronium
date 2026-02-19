@@ -718,6 +718,12 @@ class HtnRecursivePlannerBackend:
                 critical=True,
             ))
 
+        # If we already have specific actionable missing fields, avoid a vague
+        # umbrella "source" question to reduce redundant clarifications.
+        # This keeps the UI/CLI flow clean (e.g. only ask for url if web summary).
+        if any(m.field in {"url", "doc_paths"} for m in missing):
+            missing = [m for m in missing if m.field != "source"]
+
         # Stable dedupe by field+reason
         dedup: dict[tuple[str, str], MissingField] = {}
         for mf in missing:
@@ -734,6 +740,8 @@ class HtnRecursivePlannerBackend:
         execute_graph: ExecutePlannerGraphFn,
         options: _BackendOptions,
     ) -> ClarificationRequest:
+        # Prefer model-generated questions (more natural UX),
+        # but always fall back deterministically if the model path fails.
         questions = self._build_clarification_questions_with_model(
             request=request,
             missing_fields=missing_fields,
@@ -838,6 +846,10 @@ class HtnRecursivePlannerBackend:
                             "You generate clarification questions for a user in Russian. "
                             "Use only provided missing field keys. Return strict JSON."
                         ),
+                        # Keep clarification UX snappy. If this model call is slow,
+                        # fall back to deterministic questions instead of waiting.
+                        "timeout_seconds": 12,
+                        "max_retries": 0,
                         "json_schema": schema,
                     },
                 )

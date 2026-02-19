@@ -2,6 +2,8 @@
 
 These tests use replay-recorded responses to ensure full determinism
 without external service calls.
+
+B11: determinism contract (get_determinism_contract), strict mode, determinism_audit.
 """
 
 from __future__ import annotations
@@ -11,17 +13,22 @@ from pathlib import Path
 import pytest
 
 from neuronium_agent._canonical import canonical_json
-from neuronium_agent.config import AppConfig, StorageConfig, ProjectConfig
+from neuronium_agent.config import AppConfig, DeterminismConfig, ProjectConfig, StorageConfig
 from neuronium_agent.execution.executor import DAGExecutor
 from neuronium_agent.nodes.base import NodeContext, NodeInput, NodeOutput
 from neuronium_agent.nodes.model_node import ModelNode
 from neuronium_agent.nodes.code_node import CodeNode
+from neuronium_agent.nodes.mcp_node import McpToolNode
+from neuronium_agent.nodes.determinism import DeterminismContract
 from neuronium_agent.planning.dag import (
     ActionGraph,
     GraphEdge,
     GraphMetadata,
     GraphNode,
 )
+from neuronium_agent.errors import ConfigError
+from neuronium_agent.storage.fs_cas import FsCasStore
+from neuronium_agent.storage.sqlite_store import SqliteIndexStore
 
 
 def _make_graph() -> ActionGraph:
@@ -149,3 +156,114 @@ class TestDeterministicExecution:
         s1 = canonical_json(g1.model_dump(mode="json"))
         s2 = canonical_json(g2.model_dump(mode="json"))
         assert s1 == s2
+
+
+class TestDeterminismContractB11:
+    """B11: get_determinism_contract() and declared_non_deterministic."""
+
+    def test_model_node_uses_seed(self) -> None:
+        node = ModelNode(node_id="m1")
+        c = node.get_determinism_contract()
+        assert c.uses_seed is True
+        assert c.declared_non_deterministic is False
+
+    def test_code_node_uses_seed(self) -> None:
+        node = CodeNode(node_id="c1")
+        c = node.get_determinism_contract()
+        assert c.uses_seed is True
+        assert c.declared_non_deterministic is False
+
+    def test_mcp_node_default_deterministic(self) -> None:
+        node = McpToolNode(node_id="mcp1")
+        c = node.get_determinism_contract()
+        assert c.uses_seed is False
+        assert c.declared_non_deterministic is False
+
+    def test_mcp_node_declared_non_deterministic(self) -> None:
+        node = McpToolNode(node_id="mcp2", deterministic=False)
+        c = node.get_determinism_contract()
+        assert c.uses_seed is False
+        assert c.declared_non_deterministic is True
+
+
+class TestDeterminismStrictModeB11:
+    """B11: strict mode rejects declared non-deterministic nodes unless in allowlist."""
+
+    def test_strict_rejects_mcp_non_deterministic(
+        self, tmp_path: Path
+    ) -> None:
+        from neuronium_agent.core.orchestrator import Orchestrator
+        from neuronium_agent.config import DeterminismConfig
+
+        config = AppConfig(
+            project=ProjectConfig(name="t", data_dir=str(tmp_path / ".n")),
+            storage=StorageConfig(
+                fs_cas_root=str(tmp_path / "blobs"),
+                sqlite_path=str(tmp_path / "idx.sqlite3"),
+            ),
+            determinism=DeterminismConfig(strict=True),
+        )
+        blob = FsCasStore(config.storage.fs_cas_root)
+        idx = SqliteIndexStore(config.storage.sqlite_path)
+        orch = Orchestrator(config, blob, idx)
+
+        graph = ActionGraph(
+            metadata=GraphMetadata(
+                plan_id="p",
+                description="strict test",
+                created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            ),
+            nodes=[
+                GraphNode(
+                    node_id="mcp_nd",
+                    node_type="mcp",
+                    label="tool",
+                    priority=0,
+                    parameters={"deterministic": False},
+                ),
+            ],
+            edges=[],
+        )
+        with pytest.raises(ConfigError, match="declared non-deterministic"):
+            orch._build_node_registry(graph)
+
+    def test_strict_allows_mcp_non_deterministic_when_in_allowlist(
+        self, tmp_path: Path
+    ) -> None:
+        from neuronium_agent.core.orchestrator import Orchestrator
+
+        config = AppConfig(
+            project=ProjectConfig(name="t", data_dir=str(tmp_path / ".n")),
+            storage=StorageConfig(
+                fs_cas_root=str(tmp_path / "blobs"),
+                sqlite_path=str(tmp_path / "idx.sqlite3"),
+            ),
+            determinism=DeterminismConfig(
+                strict=True,
+                mcp_allow_non_deterministic_tool_ids=["mcp_nd"],
+            ),
+        )
+        blob = FsCasStore(config.storage.fs_cas_root)
+        idx = SqliteIndexStore(config.storage.sqlite_path)
+        orch = Orchestrator(config, blob, idx)
+
+        graph = ActionGraph(
+            metadata=GraphMetadata(
+                plan_id="p",
+                description="allowlist test",
+                created_at=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            ),
+            nodes=[
+                GraphNode(
+                    node_id="mcp_nd",
+                    node_type="mcp",
+                    label="tool",
+                    priority=0,
+                    parameters={"deterministic": False},
+                ),
+            ],
+            edges=[],
+        )
+        registry = orch._build_node_registry(graph)
+        assert "mcp_nd" in registry
+        assert registry["mcp_nd"].get_determinism_contract().declared_non_deterministic is True

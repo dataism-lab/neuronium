@@ -20,7 +20,8 @@ from pydantic.config import ConfigDict
 class DemoCriticVerdict(BaseModel):
     """Minimal critic verdict contract (demo only).
 
-    Fields are intentionally limited — no extra modes or extensions.
+    Fields are intentionally limited. Optional ``suggestions`` (B2 §7.2.2)
+    allows critics to propose fix hints for verdict-driven local fix.
     """
 
     # Required for OpenAI `response_format: json_schema` strict mode:
@@ -31,6 +32,8 @@ class DemoCriticVerdict(BaseModel):
     confidence: float = 1.0
     evidence: list[str] = Field(default_factory=list)
     gaps: list[str] = Field(default_factory=list)
+    # Optional fix hints: list of dicts with e.g. action, expected_improvement, effort_estimate
+    suggestions: list[dict[str, Any]] = Field(default_factory=list)
 
 
 def critic_json_schema() -> dict[str, Any]:
@@ -38,13 +41,14 @@ def critic_json_schema() -> dict[str, Any]:
 
     Some OpenAI-compatible endpoints require:
     - `additionalProperties: false` for objects
-    - `required` to include *every* key in `properties` (even those with defaults)
+    - `required` to include every key in `properties` except optional ones (e.g. suggestions)
     """
     schema: dict[str, Any] = DemoCriticVerdict.model_json_schema()
     props = schema.get("properties")
     if isinstance(props, dict):
-        keys = list(props.keys())
-        schema["required"] = keys
+        # Keep suggestions optional so old responses without it still parse
+        required = [k for k in props if k != "suggestions"]
+        schema["required"] = required
         schema["additionalProperties"] = False
     return schema
 

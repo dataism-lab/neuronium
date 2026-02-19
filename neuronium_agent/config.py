@@ -35,6 +35,10 @@ class DeterminismConfig(BaseModel):
     canonical_json: str = "neuronium-v1"
     default_random_seed: int = 0
     llm_temperature: float = 0.0
+    strict: bool = False
+    """When True, reject nodes with declared_non_deterministic at registry build (Spec §1.2.1)."""
+    mcp_allow_non_deterministic_tool_ids: list[str] = Field(default_factory=list)
+    """Tool/node IDs allowed to be non-deterministic when strict is True (allowlist)."""
 
 
 class RuntimeConfig(BaseModel):
@@ -73,6 +77,25 @@ class LLMConfig(BaseModel):
     structured_output: bool = True
     timeout_seconds: int = 60
     max_retries: int = 2
+
+
+class ModelCatalogEntry(BaseModel):
+    """Single model entry in the catalog (B13, Spec §5.2.1)."""
+
+    id: str
+    provider: str = "openai"
+    model: str = "gpt-4.1-mini"
+    api_key_env: str | None = None
+    """If None, fall back to llm.api_key_env."""
+    base_url: str | None = None
+    description: str | None = None
+
+
+class ModelCatalogConfig(BaseModel):
+    """Model catalog: default model id + list of entries (B13)."""
+
+    default_model_id: str = "default"
+    models: list[ModelCatalogEntry] = Field(default_factory=list)
 
 
 class McpServerPolicy(BaseModel):
@@ -156,6 +179,20 @@ class LoggingConfig(BaseModel):
     path: str = ".neuronium/logs/neuronium.jsonl"
 
 
+class RecoveryConfig(BaseModel):
+    """Recovery and retry policy (B1 Part 1 + B1 Part 2, B2 verdict local fix)."""
+
+    max_node_retries: int = 3
+    max_stage_retries: int = 2
+    retry_backoff_base_seconds: float = 1.0
+    retry_count_upgrade_threshold: int = 2  # After this many node retries → PERSISTENT
+    # B1 Part 2: configurable escalation (§3.4.2)
+    repeated_rollback_threshold: int = 3  # Same node fails this many times → escalate
+    allow_auto_replan: bool = False  # When True, may return REPLAN instead of ESCALATE
+    # B2 Part 1: max retries of stage with verdict fix context (gaps/suggestions) before normal recovery
+    max_verdict_fix_attempts: int = 1
+
+
 # ---------------------------------------------------------------------------
 # Root config
 # ---------------------------------------------------------------------------
@@ -169,10 +206,13 @@ class AppConfig(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    model_catalog: ModelCatalogConfig | None = None
+    """If None, model nodes use llm.* only; no catalog resolution."""
     mcp: McpConfig = Field(default_factory=McpConfig)
     code_node: CodeNodeConfig = Field(default_factory=CodeNodeConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    recovery: RecoveryConfig = Field(default_factory=RecoveryConfig)
 
 
 # ---------------------------------------------------------------------------
@@ -198,6 +238,10 @@ _FLAT_ENV_MAP: dict[str, tuple[str, ...]] = {
     "NEURONIUM_LLM_MODEL": ("llm", "model"),
     "NEURONIUM_LLM_BASE_URL": ("llm", "base_url"),
     "NEURONIUM_LOGGING_LEVEL": ("logging", "level"),
+    "NEURONIUM_RECOVERY_MAX_NODE_RETRIES": ("recovery", "max_node_retries"),
+    "NEURONIUM_RECOVERY_MAX_STAGE_RETRIES": ("recovery", "max_stage_retries"),
+    "NEURONIUM_RECOVERY_MAX_VERDICT_FIX_ATTEMPTS": ("recovery", "max_verdict_fix_attempts"),
+    "NEURONIUM_MODEL_CATALOG_DEFAULT_MODEL_ID": ("model_catalog", "default_model_id"),
 }
 
 

@@ -1,14 +1,10 @@
 """Orchestrator — the Cognitive Core loop (IBS §1.1).
 
-Supports two execution paths:
-
-1. **Fixed 2-iteration autofix demo** (``runbook_id="autofix_demo"``):
-   iter1 → critic → (if fail) → replan → iter2 → critic → done/fail.
-
-2. **Generic N-stage runbook runner** (any registered ``Runbook``):
-   each stage goes through COMMIT → EXECUTE → CONTROL → ADAPT with
-   quality-gate evaluation.  Resume/skip logic is generalised for an
-   arbitrary number of stages.
+Single execution path: **generic N-stage runbook runner** for any registered
+``Runbook`` (including ``autofix_demo``, which is a two-stage runbook).
+Each stage goes through COMMIT → EXECUTE → CONTROL → ADAPT with
+quality-gate evaluation.  Resume/skip logic is generalised for an
+arbitrary number of stages.
 
 Phase-boundary checkpoints are recorded between each phase transition
 to support resume.  Meta-control commands are **declarative**: they
@@ -32,6 +28,11 @@ from neuronium_agent.artifacts.user_renderer import (
     render_user_facing_html,
 )
 from neuronium_agent.config import AppConfig
+from neuronium_agent.errors import ConfigError
+from neuronium_agent.model_catalog_defaults import (
+    get_default_catalog,
+    resolve_model_for_node,
+)
 from neuronium_agent.core.state import (
     AgentState,
     Intention,
@@ -65,8 +66,21 @@ from neuronium_agent.trace.checkpoints import (
     load_state_from_checkpoint,
     CheckpointError,
 )
+from neuronium_agent.trace.decision_record import (
+    DecisionAuthority,
+    DecisionRecord,
+    DecisionType,
+    OptionConsidered,
+    OutcomeCorrelation,
+    SelectedOption,
+)
 from neuronium_agent.trace.recorder import TraceRecorder
 from neuronium_agent.trace.replay import ReplayProvider
+from neuronium_agent.recovery import (
+    RecoveryAction,
+    compute_rollback_scope,
+    decide_recovery,
+)
 from neuronium_agent.types import ControlCommand, RunHandle, RunRequest, RunStatus
 from neuronium_agent.verification.demo_critic import (
     DemoCriticVerdict,
@@ -146,6 +160,7 @@ class Orchestrator:
         recorder.record_decision(
             "Intention committed",
             {"objective": request.objective, "constraints": request.constraints},
+            decision_type=DecisionType.PLANNING,
         )
 
         runbook_id = (
@@ -155,6 +170,15 @@ class Orchestrator:
         recorder.record_decision(
             "Runbook selected",
             {"runbook_id": runbook_id},
+            record=DecisionRecord(
+                decision_type=DecisionType.PLANNING,
+                selected_option=SelectedOption(
+                    option_id=runbook_id,
+                    selection_rationale="Runbook selected",
+                    decision_authority=DecisionAuthority.COMPONENT,
+                    expected_outcome="Run proceeds with selected runbook",
+                ),
+            ),
         )
 
         handle = RunHandle(
@@ -164,9 +188,7 @@ class Orchestrator:
         )
 
         # Run synchronously (batch mode)
-        if runbook_id == "autofix_demo":
-            self._run_cycle(state, recorder)
-        elif get_runbook(runbook_id) is not None:
+        if get_runbook(runbook_id) is not None:
             self._run_runbook(
                 state, recorder,
                 runbook_id=runbook_id,
@@ -228,6 +250,7 @@ class Orchestrator:
         recorder.record_decision(
             "Replay started",
             {"replay_of_trace_id": original_trace_id, "strict": True},
+            decision_type=DecisionType.EXECUTION,
         )
 
         handle = RunHandle(
@@ -235,17 +258,39 @@ class Orchestrator:
             execution_id=execution_id,
             created_at=now,
         )
-        runbook_id = self._infer_runbook_id(original_trace_id) or "autofix_demo"
+        # Prefer runbook_id and metadata from original trace's checkpoint
+        replay_resume_ctx: dict[str, Any] = {}
+        try:
+            orig_cp = get_latest_phase_boundary_checkpoint(
+                self.index_store, original_trace_id,
+            )
+            if orig_cp is not None:
+                _, replay_resume_ctx = load_state_from_checkpoint(orig_cp)
+        except CheckpointError:
+            pass
+        runbook_id = (
+            replay_resume_ctx.get("runbook_id")
+            or self._infer_runbook_id(original_trace_id)
+            or "autofix_demo"
+        )
         recorder.record_decision(
             "Runbook selected (replay)",
             {"runbook_id": runbook_id, "replay_of_trace_id": original_trace_id},
+            record=DecisionRecord(
+                decision_type=DecisionType.PLANNING,
+                selected_option=SelectedOption(
+                    option_id=runbook_id or "default",
+                    selection_rationale="Runbook selected (replay)",
+                    decision_authority=DecisionAuthority.COMPONENT,
+                    expected_outcome="Replay proceeds with selected runbook",
+                ),
+            ),
         )
-        if runbook_id == "autofix_demo":
-            self._run_cycle(state, recorder, replay_provider=replay_provider)
-        elif get_runbook(runbook_id) is not None:
-            # Best-effort metadata reconstruction for replay
-            replay_metadata = self._infer_runbook_metadata(
-                original_trace_id, runbook_id,
+        if get_runbook(runbook_id) is not None:
+            replay_metadata = (
+                replay_resume_ctx.get("metadata")
+                if isinstance(replay_resume_ctx.get("metadata"), dict)
+                else self._infer_runbook_metadata(original_trace_id, runbook_id)
             )
             self._run_runbook(
                 state, recorder,
@@ -409,13 +454,34 @@ class Orchestrator:
         recorder.record_decision(
             "control_command: " + cmd,
             {"command": cmd, "payload": payload},
+            record=DecisionRecord(
+                decision_type=DecisionType.META_CONTROL,
+                selected_option=SelectedOption(
+                    option_id=cmd,
+                    selection_rationale="control_command: " + cmd,
+                    decision_authority=DecisionAuthority.USER,
+                    expected_outcome="State and checkpoint updated per command",
+                ),
+            ),
         )
         iteration = payload.get("iteration", 0)
+        extra: dict[str, Any] = {"control_command": cmd, "control_payload": payload}
+        # Preserve runbook_id and metadata from latest checkpoint for resume
+        try:
+            cp = get_latest_phase_boundary_checkpoint(self.index_store, state.trace_id)
+            if cp is not None:
+                _, resume_ctx = load_state_from_checkpoint(cp)
+                if resume_ctx.get("runbook_id"):
+                    extra["runbook_id"] = resume_ctx["runbook_id"]
+                if isinstance(resume_ctx.get("metadata"), dict):
+                    extra["metadata"] = resume_ctx["metadata"]
+        except CheckpointError:
+            pass
         cp_payload = build_checkpoint_payload(
             state,
             iteration=iteration,
             phase_boundary="paused" if state.run_state == RunState.PAUSED else "after_control_command",
-            extra={"control_command": cmd, "control_payload": payload},
+            extra=extra,
         )
         recorder.record_checkpoint(cp_payload)
 
@@ -468,6 +534,7 @@ class Orchestrator:
             "Resume from checkpoint",
             {"phase_boundary": resume_ctx.get("phase_boundary"),
              "iteration": resume_ctx.get("iteration")},
+            decision_type=DecisionType.EXECUTION,
         )
 
         # Dispatch based on runbook_id
@@ -479,15 +546,29 @@ class Orchestrator:
         recorder.record_decision(
             "Runbook selected (resume)",
             {"runbook_id": runbook_id},
+            record=DecisionRecord(
+                decision_type=DecisionType.PLANNING,
+                selected_option=SelectedOption(
+                    option_id=runbook_id,
+                    selection_rationale="Runbook selected (resume)",
+                    decision_authority=DecisionAuthority.COMPONENT,
+                    expected_outcome="Resume proceeds with selected runbook",
+                ),
+            ),
         )
 
-        if runbook_id == "autofix_demo":
-            self._run_cycle(
-                state, recorder,
-                resume_ctx=resume_ctx,
+        if get_runbook(runbook_id) is not None:
+            resume_metadata = (
+                dict(resume_ctx["metadata"])
+                if isinstance(resume_ctx.get("metadata"), dict)
+                else self._infer_runbook_metadata(trace_id, runbook_id)
             )
-        elif get_runbook(runbook_id) is not None:
-            resume_metadata = self._infer_runbook_metadata(trace_id, runbook_id)
+            if isinstance(resume_ctx.get("metadata"), dict):
+                # Merge inferred (e.g. revise/clarification answers) so post-checkpoint updates are included
+                inferred = self._infer_runbook_metadata(trace_id, runbook_id)
+                for k, v in inferred.items():
+                    if v is not None:
+                        resume_metadata[k] = v
             self._run_runbook(
                 state, recorder,
                 runbook_id=runbook_id,
@@ -539,6 +620,7 @@ class Orchestrator:
                 recorder.record_decision(
                     "strict_fail: LLM unavailable",
                     {"api_key_env": self.config.llm.api_key_env},
+                    decision_type=DecisionType.ESCALATION,
                 )
                 return
 
@@ -566,6 +648,8 @@ class Orchestrator:
             # Resume: determine which stage/phase to skip to
             resume_boundary = resume_ctx.get("phase_boundary", "") if resume_ctx else ""
             resume_stage_index = resume_ctx.get("stage_index", 0) if resume_ctx else 0
+            prev_stage_results: dict[str, NodeOutput] = {}
+            prev_stage_verdict: DemoCriticVerdict | None = None
 
             for stage_index, stage in enumerate(stages):
                 iteration = stage_index + 1  # 1-based for checkpoint compatibility
@@ -590,7 +674,31 @@ class Orchestrator:
                     skip_control = resume_boundary in past_control
 
                 graph = stage.graph
-                if stage.dynamic_planner is not None and skip_commit:
+                graph_builder_initial_inputs: dict[str, Any] | None = None
+                if stage.graph_builder is not None:
+                    if skip_commit:
+                        planned_graph = (resume_ctx or {}).get("planned_graph")
+                        if not isinstance(planned_graph, dict):
+                            raise ValueError(
+                                "Resume for graph_builder stage requires "
+                                "'planned_graph' in checkpoint resume_context"
+                            )
+                        graph = ActionGraph.model_validate(planned_graph)
+                    else:
+                        builder_context: dict[str, Any] = {
+                            "objective": objective,
+                            "constraints": constraints,
+                            "prev_stage_results": prev_stage_results,
+                            "prev_stage_verdict": prev_stage_verdict,
+                            "execution_id": state.execution_id,
+                            "metadata": metadata,
+                        }
+                        result = stage.graph_builder(builder_context)
+                        if isinstance(result, tuple):
+                            graph, graph_builder_initial_inputs = result[0], result[1]
+                        else:
+                            graph = result
+                elif stage.dynamic_planner is not None and skip_commit:
                     planned_graph = (resume_ctx or {}).get("planned_graph")
                     if not isinstance(planned_graph, dict):
                         raise ValueError(
@@ -619,6 +727,11 @@ class Orchestrator:
                 planner_backend_version = ""
                 operator_catalog_hash = ""
                 planner_trace_payload: dict[str, Any] = {}
+                stage_retry_count = (
+                    int(resume_ctx.get("stage_retry_count", 0))
+                    if (resume_ctx and stage_index == resume_stage_index)
+                    else 0
+                )
 
                 # -- COMMIT ----------------------------------------------------
                 if not skip_commit:
@@ -632,6 +745,9 @@ class Orchestrator:
                             stage_id=stage.stage_id,
                             metadata=metadata,
                             spec=stage.dynamic_planner,
+                            stage_default_model_id=getattr(
+                                stage, "default_model_id", None
+                            ),
                         )
                         if isinstance(planner_outcome, PlannerEscalation):
                             self._pause_for_planner_escalation(
@@ -639,6 +755,7 @@ class Orchestrator:
                                 recorder=recorder,
                                 iteration=iteration,
                                 runbook_id=runbook_id,
+                                metadata=metadata,
                                 stage_id=stage.stage_id,
                                 stage_index=stage_index,
                                 escalation=planner_outcome,
@@ -673,6 +790,7 @@ class Orchestrator:
                                 "operator_catalog_hash": operator_catalog_hash,
                                 "planner_decision_trace": planner_trace_payload,
                             },
+                            decision_type=DecisionType.PLANNING,
                         )
                     else:
                         recorder.record_decision(
@@ -685,14 +803,16 @@ class Orchestrator:
                                 "nodes": [n.node_id for n in graph.nodes],
                                 "edges": [(e.source, e.target) for e in graph.edges],
                             },
+                            decision_type=DecisionType.PLANNING,
                         )
                     state.intention.plan_id = graph.metadata.plan_id  # type: ignore[union-attr]
                     commit_extra: dict[str, Any] = {
                         "runbook_id": runbook_id,
+                        "metadata": metadata,
                         "stage_id": stage.stage_id,
                         "stage_index": stage_index,
                     }
-                    if stage.dynamic_planner is not None:
+                    if stage.dynamic_planner is not None or stage.graph_builder is not None:
                         commit_extra["planned_graph"] = graph.model_dump(mode="json")
                         commit_extra["planner_backend"] = planner_backend_name
                         commit_extra["planner_backend_version"] = planner_backend_version
@@ -704,117 +824,407 @@ class Orchestrator:
                         extra=commit_extra,
                     )
 
-                # -- EXECUTE ---------------------------------------------------
-                if not skip_execute:
-                    state.intention.phase = IntentionPhase.EXECUTE  # type: ignore[union-attr]
-                    results = self._execute(
-                        state, graph, recorder,
-                        replay_provider=replay_provider,
-                        initial_inputs_override=stage.initial_inputs_override,
-                    )
-                    # Build gate snapshot for resume
-                    gate_snapshot = self._build_gate_snapshot(results, gate)
-                    self._write_phase_checkpoint(
-                        state, recorder, iteration,
-                        f"after_execute_iter{iteration}",
-                        extra={
-                            "runbook_id": runbook_id,
-                            "stage_id": stage.stage_id,
-                            "stage_index": stage_index,
-                            "gate_snapshot": gate_snapshot,
-                        }
-                        | (
-                            {"planned_graph": graph.model_dump(mode="json")}
-                            if stage.dynamic_planner is not None
-                            else {}
-                        ),
-                    )
-                else:
-                    # Restore gate snapshot from resume context
-                    gate_snapshot = (resume_ctx or {}).get("gate_snapshot")
-
-                # -- CONTROL (quality gate) ------------------------------------
-                if not skip_control:
-                    state.intention.phase = IntentionPhase.CONTROL  # type: ignore[union-attr]
-
-                    if gate.critic_node_id and not skip_execute:
-                        verdict = self._extract_verdict(results, gate.critic_node_id)
-                    elif gate.critic_node_id and gate_snapshot:
-                        # Restore verdict from gate snapshot (resume path)
-                        verdict = DemoCriticVerdict(
-                            verdict=gate_snapshot.get("critic_verdict", "UNCERTAIN"),
-                            confidence=gate_snapshot.get("critic_confidence", 0.0),
-                            evidence=gate_snapshot.get("critic_evidence", []),
-                            gaps=gate_snapshot.get("critic_gaps", []),
+                # -- EXECUTE + CONTROL + ADAPT (with retry-stage loop) ---------
+                failure_history_in_stage: list[list[str]] = []
+                verdict_fix_attempts = 0
+                stage_verdict_fix_override: dict[str, Any] | None = None
+                while True:
+                    if not skip_execute:
+                        state.intention.phase = IntentionPhase.EXECUTE  # type: ignore[union-attr]
+                        execute_inputs = (stage.initial_inputs_override or {}) | (
+                            graph_builder_initial_inputs or {}
+                        ) | (stage_verdict_fix_override or {})
+                        results = self._execute(
+                            state, graph, recorder,
+                            replay_provider=replay_provider,
+                            initial_inputs_override=execute_inputs or None,
+                            stage_default_model_id=getattr(
+                                stage, "default_model_id", None
+                            ),
+                        )
+                        stage_verdict_fix_override = None
+                        gate_snapshot = self._build_gate_snapshot(results, gate)
+                        self._write_phase_checkpoint(
+                            state, recorder, iteration,
+                            f"after_execute_iter{iteration}",
+                            extra={
+                                "runbook_id": runbook_id,
+                                "metadata": metadata,
+                                "stage_id": stage.stage_id,
+                                "stage_index": stage_index,
+                                "gate_snapshot": gate_snapshot,
+                                "stage_retry_count": stage_retry_count,
+                            }
+                            | (
+                                {"planned_graph": graph.model_dump(mode="json")}
+                                if stage.dynamic_planner is not None
+                                else {}
+                            ),
                         )
                     else:
-                        verdict = None
+                        gate_snapshot = (resume_ctx or {}).get("gate_snapshot")
 
-                    if verdict is not None:
-                        recorder.record("critic_verdict", {
-                            "iteration": iteration,
-                            "plan_id": graph.metadata.plan_id,
-                            "critic_node_id": gate.critic_node_id,
-                            "verdict": verdict.verdict,
-                            "confidence": verdict.confidence,
-                            "evidence": verdict.evidence,
-                            "gaps": verdict.gaps,
-                        })
+                    if not skip_control:
+                        state.intention.phase = IntentionPhase.CONTROL  # type: ignore[union-attr]
+                        if gate.critic_node_id and not skip_execute:
+                            verdict = self._extract_verdict(results, gate.critic_node_id)
+                        elif gate.critic_node_id and gate_snapshot:
+                            verdict = DemoCriticVerdict(
+                                verdict=gate_snapshot.get("critic_verdict", "UNCERTAIN"),
+                                confidence=gate_snapshot.get("critic_confidence", 0.0),
+                                evidence=gate_snapshot.get("critic_evidence", []),
+                                gaps=gate_snapshot.get("critic_gaps", []),
+                                suggestions=gate_snapshot.get("critic_suggestions", []),
+                            )
+                        else:
+                            verdict = None
+                        if verdict is not None:
+                            recorder.record("critic_verdict", {
+                                "iteration": iteration,
+                                "plan_id": graph.metadata.plan_id,
+                                "critic_node_id": gate.critic_node_id,
+                                "verdict": verdict.verdict,
+                                "confidence": verdict.confidence,
+                                "evidence": verdict.evidence,
+                                "gaps": verdict.gaps,
+                                "suggestions": verdict.suggestions,
+                            })
+                        self._write_phase_checkpoint(
+                            state, recorder, iteration,
+                            f"after_control_iter{iteration}",
+                            extra={
+                                "runbook_id": runbook_id,
+                                "metadata": metadata,
+                                "stage_id": stage.stage_id,
+                                "stage_index": stage_index,
+                                "stage_retry_count": stage_retry_count,
+                            }
+                            | (
+                                {"planned_graph": graph.model_dump(mode="json")}
+                                if stage.dynamic_planner is not None
+                                else {}
+                            ),
+                        )
 
-                    self._write_phase_checkpoint(
-                        state, recorder, iteration,
-                        f"after_control_iter{iteration}",
-                        extra={
+                    state.intention.phase = IntentionPhase.ADAPT  # type: ignore[union-attr]
+                    stage_passed = self._evaluate_gate(
+                        results if not skip_execute else {},
+                        gate, verdict, gate_snapshot,
+                    )
+                    recorder.record("stage_end", {
+                        "stage_id": stage.stage_id,
+                        "stage_index": stage_index,
+                        "runbook_id": runbook_id,
+                        "success": stage_passed,
+                        "reason": (
+                            "quality gate passed"
+                            if stage_passed
+                            else "quality gate failed"
+                        ),
+                    })
+
+                    if stage_passed:
+                        prev_stage_results = results
+                        prev_stage_verdict = verdict
+                        if stage.exit_run_on_success:
+                            state.transition_to(
+                                RunState.COMPLETED,
+                                f"{runbook_id}: stage {stage.stage_id} passed (exit_run_on_success)",
+                            )
+                            self.index_store.update_run_state(state.trace_id, "COMPLETED")
+                            state.progress = 1.0
+                            state.intention.phase = IntentionPhase.DONE  # type: ignore[union-attr]
+                            self._write_phase_checkpoint(
+                                state, recorder, iteration, "final",
+                                extra={"runbook_id": runbook_id, "metadata": metadata},
+                            )
+                            if results:
+                                self._finalize_run(
+                                    state, recorder, results, runbook_id
+                                )
+                            return
+                        break
+
+                    if stage.proceed_to_next_stage_on_fail:
+                        prev_stage_results = results
+                        prev_stage_verdict = verdict
+                        recorder.record("replan", {
+                            "iteration_from": iteration,
+                            "iteration_to": iteration + 1,
+                            "reason": "proceed_to_next_stage_on_fail",
+                            "stage_id": stage.stage_id,
                             "runbook_id": runbook_id,
+                        })
+                        break
+
+                    # Recovery: collect failed nodes, compute rollback scope, decide action
+                    failed_nodes = [
+                        (nid, results[nid])
+                        for nid in gate.required_completed_nodes
+                        if (out := results.get(nid)) and out.status != "COMPLETED"
+                    ]
+                    critic_failed = bool(
+                        gate.critic_node_id
+                        and (
+                            verdict is None
+                            or verdict.verdict != "PASS"
+                            or not (verdict.evidence if verdict else False)
+                        )
+                    )
+                    failed_node_ids = {nid for nid, _ in failed_nodes}
+                    completed_node_ids = {
+                        nid for nid, out in results.items() if out.status == "COMPLETED"
+                    }
+                    failure_type: str = (
+                        "critic_rejection" if critic_failed else "node_execution"
+                    )
+
+                    # B2 Part 1: verdict-driven local fix before decide_recovery
+                    # Only when we ran execute this iteration (not when resuming from snapshot)
+                    has_fix_hints = verdict is not None and (
+                        bool(verdict.gaps) or bool(getattr(verdict, "suggestions", []))
+                    )
+                    if (
+                        critic_failed
+                        and has_fix_hints
+                        and verdict_fix_attempts < self.config.recovery.max_verdict_fix_attempts
+                        and not skip_execute
+                    ):
+                        verdict_fix = {
+                            "gaps": verdict.gaps,
+                            "suggestions": getattr(verdict, "suggestions", []),
+                        }
+                        recorder.record("verdict_local_fix_retry", {
                             "stage_id": stage.stage_id,
                             "stage_index": stage_index,
-                        }
-                        | (
-                            {"planned_graph": graph.model_dump(mode="json")}
-                            if stage.dynamic_planner is not None
-                            else {}
+                            "runbook_id": runbook_id,
+                            "verdict_fix": verdict_fix,
+                            "verdict_fix_attempt": verdict_fix_attempts + 1,
+                        })
+                        verdict_fix_attempts += 1
+                        stage_verdict_fix_override = {"verdict_fix": verdict_fix}
+                        skip_execute = False
+                        skip_control = False
+                        continue
+
+                    rollback_scope = compute_rollback_scope(
+                        failure_type,
+                        graph,
+                        failed_node_ids,
+                        critic_failed=critic_failed,
+                        completed_node_ids=completed_node_ids,
+                        gate_required_node_ids=set(gate.required_completed_nodes),
+                    )
+                    decision = decide_recovery(
+                        failed_nodes,
+                        gate_failed=True,
+                        stage_retry_count=stage_retry_count,
+                        config=self.config,
+                        critic_failed=critic_failed,
+                        failure_history=failure_history_in_stage,
+                        rollback_scope=rollback_scope,
+                        has_dynamic_planner=stage.dynamic_planner is not None,
+                    )
+                    recorder.record_decision(
+                        "Recovery decision",
+                        {
+                            "action": decision.action.value,
+                            "reason": decision.reason,
+                            "failed_node_ids": [nid for nid, _ in failed_nodes],
+                        },
+                        record=DecisionRecord(
+                            decision_type=DecisionType.ADAPTATION,
+                            options_considered=[
+                                OptionConsidered(option_id="RETRY_STAGE", description="Retry stage"),
+                                OptionConsidered(option_id="REPLAN", description="Replan stage"),
+                                OptionConsidered(option_id="ESCALATE", description="Escalate to user"),
+                                OptionConsidered(option_id="FAIL", description="Fail run"),
+                            ],
+                            selected_option=SelectedOption(
+                                option_id=decision.action.value,
+                                selection_rationale=decision.reason,
+                                decision_authority=DecisionAuthority.COMPONENT,
+                                expected_outcome="Recovery action applied",
+                            ),
                         ),
                     )
-
-                # -- ADAPT (evaluate gate & finish/continue) -------------------
-                state.intention.phase = IntentionPhase.ADAPT  # type: ignore[union-attr]
-                stage_passed = self._evaluate_gate(
-                    results if not skip_execute else {},
-                    gate, verdict, gate_snapshot,
-                )
-
-                recorder.record("stage_end", {
-                    "stage_id": stage.stage_id,
-                    "stage_index": stage_index,
-                    "runbook_id": runbook_id,
-                    "success": stage_passed,
-                    "reason": (
-                        "quality gate passed"
-                        if stage_passed
-                        else "quality gate failed"
-                    ),
-                })
-
-                if not stage_passed:
-                    state.transition_to(
-                        RunState.FAILED,
-                        f"{runbook_id}: quality gate failed at stage {stage.stage_id}",
-                    )
-                    self.index_store.update_run_state(state.trace_id, "FAILED")
-                    state.intention.phase = IntentionPhase.DONE  # type: ignore[union-attr]
-                    self._write_phase_checkpoint(
-                        state, recorder, iteration, "final",
-                        extra={"runbook_id": runbook_id},
-                    )
-                    if results:
-                        self._persist_artifacts(state, results, recorder)
-                        self._persist_local_rendered_artifact(
-                            state=state,
-                            recorder=recorder,
-                            results=results,
-                            runbook_id=runbook_id,
+                    recovery_payload: dict[str, Any] = {
+                        "action": decision.action.value,
+                        "reason": decision.reason,
+                        "failed_nodes": [nid for nid, _ in failed_nodes],
+                        "stage_retry_count": stage_retry_count,
+                    }
+                    if decision.rollback_scope is not None:
+                        rs = decision.rollback_scope
+                        recovery_payload["rollback_scope_type"] = rs.scope_type.value
+                        recovery_payload["rollback_node_ids"] = list(rs.node_ids)
+                        recovery_payload["preservation_node_ids"] = list(
+                            rs.preservation_node_ids
                         )
-                    return
+                    recorder.record("recovery_decision", recovery_payload)
+
+                    if decision.action == RecoveryAction.FAIL:
+                        state.transition_to(
+                            RunState.FAILED,
+                            f"{runbook_id}: quality gate failed at stage {stage.stage_id}",
+                        )
+                        self.index_store.update_run_state(state.trace_id, "FAILED")
+                        state.intention.phase = IntentionPhase.DONE  # type: ignore[union-attr]
+                        self._write_phase_checkpoint(
+                            state, recorder, iteration, "final",
+                            extra={"runbook_id": runbook_id, "metadata": metadata},
+                        )
+                        if results:
+                            self._finalize_run(
+                                state,
+                                recorder,
+                                results,
+                                runbook_id,
+                                rollback_node_ids=(
+                                    decision.rollback_scope.node_ids
+                                    if decision.rollback_scope else None
+                                ),
+                            )
+                        return
+
+                    if decision.action == RecoveryAction.ESCALATE:
+                        state.transition_to(RunState.PAUSED, decision.reason)
+                        self.index_store.update_run_state(state.trace_id, "PAUSED")
+                        esc_ctx = decision.escalation_context or {}
+                        self._write_phase_checkpoint(
+                            state, recorder, iteration, "paused",
+                            extra={
+                                "runbook_id": runbook_id,
+                                "metadata": metadata,
+                                "stage_id": stage.stage_id,
+                                "stage_index": stage_index,
+                                "escalation_reason": decision.reason,
+                                "failed_node_ids": esc_ctx.get("failed_node_ids", []),
+                                "stage_retry_count": stage_retry_count,
+                            },
+                        )
+                        if results:
+                            self._finalize_run(
+                                state,
+                                recorder,
+                                results,
+                                runbook_id,
+                                rollback_node_ids=(
+                                    decision.rollback_scope.node_ids
+                                    if decision.rollback_scope else None
+                                ),
+                            )
+                        recorder.record_decision(
+                            "Escalated (recovery)",
+                            {"reason": decision.reason, "escalation_context": esc_ctx},
+                            record=DecisionRecord(
+                                decision_type=DecisionType.ESCALATION,
+                                selected_option=SelectedOption(
+                                    option_id="ESCALATE",
+                                    selection_rationale=decision.reason,
+                                    decision_authority=DecisionAuthority.COMPONENT,
+                                    expected_outcome="User resumes or revises",
+                                ),
+                                outcome_correlation=OutcomeCorrelation(
+                                    actual_outcome="escalation",
+                                    correlation_timestamp=datetime.now(timezone.utc).isoformat(),
+                                    quality_assessment="failure",
+                                ),
+                            ),
+                        )
+                        return
+
+                    if decision.action == RecoveryAction.REPLAN:
+                        if stage.dynamic_planner is not None:
+                            planner_outcome = self._plan_dynamic_graph(
+                                state=state,
+                                recorder=recorder,
+                                replay_provider=replay_provider,
+                                runbook_id=runbook_id,
+                                stage_id=stage.stage_id,
+                                metadata=metadata,
+                                spec=stage.dynamic_planner,
+                                stage_default_model_id=getattr(
+                                    stage, "default_model_id", None
+                                ),
+                            )
+                            if isinstance(planner_outcome, PlannerEscalation):
+                                self._pause_for_planner_escalation(
+                                    state=state,
+                                    recorder=recorder,
+                                    iteration=iteration,
+                                    runbook_id=runbook_id,
+                                    metadata=metadata,
+                                    stage_id=stage.stage_id,
+                                    stage_index=stage_index,
+                                    escalation=planner_outcome,
+                                )
+                                return
+                            graph = planner_outcome.action_graph
+                            state.intention.plan_id = graph.metadata.plan_id  # type: ignore[union-attr]
+                            results = {}
+                            skip_execute = False
+                            skip_control = False
+                            recorder.record("replan", {
+                                "stage_id": stage.stage_id,
+                                "reason": decision.reason,
+                            })
+                            continue
+                        # No dynamic planner: treat REPLAN as ESCALATE
+                        state.transition_to(RunState.PAUSED, decision.reason)
+                        self.index_store.update_run_state(state.trace_id, "PAUSED")
+                        esc_ctx = decision.escalation_context or {
+                            "failed_node_ids": [nid for nid, _ in failed_nodes],
+                            "replan_recommended": True,
+                        }
+                        self._write_phase_checkpoint(
+                            state, recorder, iteration, "paused",
+                            extra={
+                                "runbook_id": runbook_id,
+                                "metadata": metadata,
+                                "stage_id": stage.stage_id,
+                                "stage_index": stage_index,
+                                "escalation_reason": decision.reason,
+                                "failed_node_ids": esc_ctx.get("failed_node_ids", []),
+                                "stage_retry_count": stage_retry_count,
+                            },
+                        )
+                        if results:
+                            self._finalize_run(
+                                state,
+                                recorder,
+                                results,
+                                runbook_id,
+                                rollback_node_ids=(
+                                    decision.rollback_scope.node_ids
+                                    if decision.rollback_scope else None
+                                ),
+                            )
+                        recorder.record_decision(
+                            "Escalated (recovery, replan recommended)",
+                            {"reason": decision.reason, "escalation_context": esc_ctx},
+                            record=DecisionRecord(
+                                decision_type=DecisionType.ESCALATION,
+                                selected_option=SelectedOption(
+                                    option_id="ESCALATE",
+                                    selection_rationale=decision.reason,
+                                    decision_authority=DecisionAuthority.COMPONENT,
+                                    expected_outcome="User resumes or replans",
+                                ),
+                                outcome_correlation=OutcomeCorrelation(
+                                    actual_outcome="escalation",
+                                    correlation_timestamp=datetime.now(timezone.utc).isoformat(),
+                                    quality_assessment="failure",
+                                ),
+                            ),
+                        )
+                        return
+
+                    # RETRY_STAGE
+                    failure_history_in_stage.append([nid for nid, _ in failed_nodes])
+                    stage_retry_count += 1
+                    skip_execute = False
+                    skip_control = False
 
             # All stages passed
             state.transition_to(RunState.COMPLETED, f"{runbook_id}: all stages passed")
@@ -823,296 +1233,13 @@ class Orchestrator:
             state.intention.phase = IntentionPhase.DONE  # type: ignore[union-attr]
             self._write_phase_checkpoint(
                 state, recorder, len(stages), "final",
-                extra={"runbook_id": runbook_id},
+                extra={"runbook_id": runbook_id, "metadata": metadata},
             )
             if results:
-                self._persist_artifacts(state, results, recorder)
-                self._persist_local_rendered_artifact(
-                    state=state,
-                    recorder=recorder,
-                    results=results,
-                    runbook_id=runbook_id,
-                )
+                self._finalize_run(state, recorder, results, runbook_id)
 
         except Exception as exc:
             logger.exception("Runbook %s failed", runbook_id)
-            try:
-                state.transition_to(RunState.FAILED, str(exc))
-            except ValueError:
-                state.run_state = RunState.FAILED
-                state.message = str(exc)
-            self.index_store.update_run_state(state.trace_id, "FAILED")
-            recorder.record("error", {"error": str(exc)})
-
-    # ------------------------------------------------------------------
-    # Cognitive Core cycle (fixed 2-iteration demo loop)
-    # ------------------------------------------------------------------
-
-    def _run_cycle(
-        self,
-        state: AgentState,
-        recorder: TraceRecorder,
-        *,
-        replay_provider: ReplayProvider | None = None,
-        resume_ctx: dict[str, Any] | None = None,
-    ) -> None:
-        """Fixed demo loop with phase-boundary checkpoints.
-
-        When *resume_ctx* is provided the cycle skips already-completed
-        phases and continues from the checkpoint boundary.  Otherwise
-        runs the full iter1 → iter2 sequence.
-        """
-        # Determine starting point
-        skip_to = resume_ctx.get("phase_boundary", "") if resume_ctx else ""
-
-        try:
-            # -- Strict-fail preflight: LLM must be available ----------------
-            if replay_provider is None and not self._llm_available():
-                state.transition_to(RunState.FAILED, "LLM unavailable (strict_fail)")
-                self.index_store.update_run_state(state.trace_id, "FAILED")
-                recorder.record_decision(
-                    "strict_fail: LLM unavailable",
-                    {"api_key_env": self.config.llm.api_key_env},
-                )
-                return
-
-            if not skip_to:
-                state.transition_to(RunState.RUNNING, "Planning started")
-                self.index_store.update_run_state(state.trace_id, "RUNNING")
-
-            objective = state.intention.objective  # type: ignore[union-attr]
-            constraints = list(state.intention.constraints)  # type: ignore[union-attr]
-
-            # Variables that may be filled by iter1 or restored from ctx
-            graph1: ActionGraph | None = None
-            results1: dict[str, NodeOutput] = {}
-            verdict1: DemoCriticVerdict | None = None
-            fix_context: dict[str, Any] = {}
-            added_constraints: list[str] = []
-
-            # ============================================================
-            # ITERATION 1
-            # ============================================================
-
-            # -- COMMIT iter1 ------------------------------------------
-            if not skip_to or skip_to == "paused":
-                state.intention.phase = IntentionPhase.COMMIT  # type: ignore[union-attr]
-                graph1 = self._planner.plan_iter1(objective, constraints)
-                state.intention.plan_id = graph1.metadata.plan_id  # type: ignore[union-attr]
-                recorder.record_decision(
-                    "Plan created (iter1)",
-                    {
-                        "iteration": 1,
-                        "plan_id": graph1.metadata.plan_id,
-                        "nodes": [n.node_id for n in graph1.nodes],
-                        "edges": [(e.source, e.target) for e in graph1.edges],
-                    },
-                )
-                self._write_phase_checkpoint(state, recorder, 1, "after_commit_iter1")
-
-            # -- EXECUTE iter1 -----------------------------------------
-            if skip_to not in {
-                "after_execute_iter1", "after_control_iter1",
-                "after_adapt_iter1",
-                "after_commit_iter2", "after_execute_iter2",
-                "after_control_iter2",
-            }:
-                if graph1 is None:
-                    graph1 = self._planner.plan_iter1(objective, constraints)
-                    state.intention.plan_id = graph1.metadata.plan_id  # type: ignore[union-attr]
-
-                state.intention.phase = IntentionPhase.EXECUTE  # type: ignore[union-attr]
-                results1 = self._execute(
-                    state, graph1, recorder,
-                    replay_provider=replay_provider,
-                )
-                self._write_phase_checkpoint(state, recorder, 1, "after_execute_iter1")
-
-            # -- CONTROL iter1 -----------------------------------------
-            if skip_to not in {
-                "after_control_iter1", "after_adapt_iter1",
-                "after_commit_iter2", "after_execute_iter2",
-                "after_control_iter2",
-            }:
-                state.intention.phase = IntentionPhase.CONTROL  # type: ignore[union-attr]
-                plan_id = state.intention.plan_id or ""  # type: ignore[union-attr]
-                verdict1 = self._extract_verdict(results1, "critic")
-                recorder.record("critic_verdict", {
-                    "iteration": 1,
-                    "plan_id": plan_id,
-                    "critic_node_id": "critic",
-                    "verdict": verdict1.verdict,
-                    "confidence": verdict1.confidence,
-                    "evidence": verdict1.evidence,
-                    "gaps": verdict1.gaps,
-                })
-                self._write_phase_checkpoint(state, recorder, 1, "after_control_iter1")
-
-                exec_ok_1 = (
-                    results1.get("execute") is not None
-                    and results1["execute"].status == "COMPLETED"
-                )
-
-                if exec_ok_1 and verdict1.verdict == "PASS" and verdict1.evidence:
-                    state.intention.phase = IntentionPhase.ADAPT  # type: ignore[union-attr]
-                    state.transition_to(RunState.COMPLETED, "Iter1: critic PASS with evidence")
-                    self.index_store.update_run_state(state.trace_id, "COMPLETED")
-                    state.progress = 1.0
-                    state.intention.phase = IntentionPhase.DONE  # type: ignore[union-attr]
-                    self._write_phase_checkpoint(state, recorder, 1, "final")
-                    self._persist_artifacts(state, results1, recorder)
-                    self._persist_local_rendered_artifact(
-                        state=state,
-                        recorder=recorder,
-                        results=results1,
-                        runbook_id="autofix_demo",
-                    )
-                    return
-
-            # -- ADAPT iter1 (replan decision) ----------------------------
-            if skip_to not in {
-                "after_adapt_iter1",
-                "after_commit_iter2", "after_execute_iter2",
-                "after_control_iter2",
-            }:
-                state.intention.phase = IntentionPhase.ADAPT  # type: ignore[union-attr]
-
-                if verdict1 is None:
-                    verdict1 = DemoCriticVerdict(
-                        verdict="UNCERTAIN",
-                        confidence=0.0,
-                        evidence=[],
-                        gaps=["resume: no verdict1 available"],
-                    )
-
-                fix_context = self._build_fix_context(results1, verdict1)
-                added_constraints = self._build_added_constraints(results1, verdict1)
-
-                exec_ok_1_adapt = (
-                    results1.get("execute") is not None
-                    and results1["execute"].status == "COMPLETED"
-                )
-
-                recorder.record("replan", {
-                    "iteration_from": 1,
-                    "iteration_to": 2,
-                    "reason": self._replan_reason(exec_ok_1_adapt, verdict1),
-                    "added_constraints": added_constraints,
-                    "previous_plan_id": state.intention.plan_id or "",  # type: ignore[union-attr]
-                    "new_plan_id": "(pending)",
-                })
-                self._write_phase_checkpoint(
-                    state, recorder, 1, "after_adapt_iter1",
-                    extra={"fix_context": fix_context,
-                           "added_constraints": added_constraints},
-                )
-            else:
-                # Restore fix_context from resume_ctx if skipping
-                if resume_ctx:
-                    fix_context = resume_ctx.get("fix_context", {})
-                    added_constraints = resume_ctx.get("added_constraints", [])
-
-            # ============================================================
-            # ITERATION 2 (fix-pipeline)
-            # ============================================================
-
-            # -- COMMIT iter2 ------------------------------------------
-            if skip_to not in {
-                "after_execute_iter2", "after_control_iter2",
-            }:
-                state.intention.phase = IntentionPhase.COMMIT  # type: ignore[union-attr]
-                graph2 = self._planner.plan_iter2_fix(
-                    objective,
-                    constraints + added_constraints,
-                    fix_context=fix_context,
-                )
-                state.intention.plan_id = graph2.metadata.plan_id  # type: ignore[union-attr]
-                recorder.record_decision(
-                    "Plan created (iter2 fix-pipeline)",
-                    {
-                        "iteration": 2,
-                        "plan_id": graph2.metadata.plan_id,
-                        "nodes": [n.node_id for n in graph2.nodes],
-                        "edges": [(e.source, e.target) for e in graph2.edges],
-                    },
-                )
-                self._write_phase_checkpoint(state, recorder, 2, "after_commit_iter2")
-            else:
-                # Need graph2 for execution
-                graph2 = self._planner.plan_iter2_fix(
-                    objective,
-                    constraints + added_constraints,
-                    fix_context=fix_context,
-                )
-                state.intention.plan_id = graph2.metadata.plan_id  # type: ignore[union-attr]
-
-            # -- EXECUTE iter2 -----------------------------------------
-            if skip_to not in {"after_control_iter2"}:
-                state.intention.phase = IntentionPhase.EXECUTE  # type: ignore[union-attr]
-                results2 = self._execute(
-                    state, graph2, recorder,
-                    replay_provider=replay_provider,
-                    initial_inputs_override=fix_context,
-                )
-                self._write_phase_checkpoint(state, recorder, 2, "after_execute_iter2")
-            else:
-                results2 = {}
-
-            # -- CONTROL iter2 -----------------------------------------
-            state.intention.phase = IntentionPhase.CONTROL  # type: ignore[union-attr]
-            verdict2 = self._extract_verdict(results2, "critic_fix")
-            recorder.record("critic_verdict", {
-                "iteration": 2,
-                "plan_id": graph2.metadata.plan_id,
-                "critic_node_id": "critic_fix",
-                "verdict": verdict2.verdict,
-                "confidence": verdict2.confidence,
-                "evidence": verdict2.evidence,
-                "gaps": verdict2.gaps,
-            })
-            self._write_phase_checkpoint(state, recorder, 2, "after_control_iter2")
-
-            exec_ok_2 = (
-                results2.get("execute_fix") is not None
-                and results2["execute_fix"].status == "COMPLETED"
-            )
-
-            state.intention.phase = IntentionPhase.ADAPT  # type: ignore[union-attr]
-
-            if exec_ok_2 and verdict2.verdict == "PASS" and verdict2.evidence:
-                state.transition_to(RunState.COMPLETED, "Iter2: critic PASS with evidence")
-                self.index_store.update_run_state(state.trace_id, "COMPLETED")
-                state.progress = 1.0
-            else:
-                state.transition_to(
-                    RunState.FAILED,
-                    "Auto-fix exhausted after 2 iterations",
-                )
-                self.index_store.update_run_state(state.trace_id, "FAILED")
-
-            state.intention.phase = IntentionPhase.DONE  # type: ignore[union-attr]
-            self._write_phase_checkpoint(state, recorder, 2, "final")
-
-            # Persist artifacts from whichever iteration produced results
-            if results1:
-                self._persist_artifacts(state, results1, recorder)
-                self._persist_local_rendered_artifact(
-                    state=state,
-                    recorder=recorder,
-                    results=results1,
-                    runbook_id="autofix_demo",
-                )
-            if results2:
-                self._persist_artifacts(state, results2, recorder)
-                self._persist_local_rendered_artifact(
-                    state=state,
-                    recorder=recorder,
-                    results=results2,
-                    runbook_id="autofix_demo",
-                )
-
-        except Exception as exc:
-            logger.exception("Orchestrator cycle failed")
             try:
                 state.transition_to(RunState.FAILED, str(exc))
             except ValueError:
@@ -1286,6 +1413,7 @@ class Orchestrator:
                     snapshot["critic_confidence"] = parsed.get("confidence", 0.0)
                     snapshot["critic_evidence"] = parsed.get("evidence", [])
                     snapshot["critic_gaps"] = parsed.get("gaps", [])
+                    snapshot["critic_suggestions"] = parsed.get("suggestions", [])
                 else:
                     # Best-effort from raw JSON
                     try:
@@ -1296,11 +1424,13 @@ class Orchestrator:
                     snapshot["critic_confidence"] = d.get("confidence", 0.0)
                     snapshot["critic_evidence"] = d.get("evidence", [])
                     snapshot["critic_gaps"] = d.get("gaps", [])
+                    snapshot["critic_suggestions"] = d.get("suggestions", [])
             else:
                 snapshot["critic_verdict"] = "UNCERTAIN"
                 snapshot["critic_confidence"] = 0.0
                 snapshot["critic_evidence"] = []
                 snapshot["critic_gaps"] = ["critic node did not complete"]
+                snapshot["critic_suggestions"] = []
         return snapshot
 
     @staticmethod
@@ -1378,53 +1508,6 @@ class Orchestrator:
                 pass
         return parse_critic_verdict(raw)
 
-    def _build_fix_context(
-        self,
-        results: dict[str, NodeOutput],
-        verdict: DemoCriticVerdict,
-    ) -> dict[str, Any]:
-        """Build initial_inputs for the fix-pipeline from iteration 1 results."""
-        ctx: dict[str, Any] = {}
-
-        gen = results.get("generate")
-        if gen and gen.status == "COMPLETED":
-            ctx["previous_code"] = gen.outputs.get("content", "")
-
-        exe = results.get("execute")
-        if exe:
-            ctx["previous_exit_code"] = exe.outputs.get("exit_code", -1)
-            ctx["previous_stdout"] = exe.outputs.get("stdout", "")
-            ctx["previous_stderr"] = exe.outputs.get("stderr", "")
-
-        ctx["previous_verdict"] = verdict.verdict
-        ctx["previous_gaps"] = verdict.gaps
-        return ctx
-
-    def _build_added_constraints(
-        self,
-        results: dict[str, NodeOutput],
-        verdict: DemoCriticVerdict,
-    ) -> list[str]:
-        """Derive added constraints from iteration 1 failure."""
-        added: list[str] = []
-        exe = results.get("execute")
-        if exe and exe.status == "FAILED":
-            stderr = exe.outputs.get("stderr", "") or exe.error or ""
-            if stderr:
-                added.append(f"Fix execution error: {stderr[:300]}")
-        for gap in verdict.gaps:
-            added.append(f"Fix gap: {gap}")
-        return added
-
-    @staticmethod
-    def _replan_reason(exec_ok: bool, verdict: DemoCriticVerdict) -> str:
-        parts: list[str] = []
-        if not exec_ok:
-            parts.append("exec_failed")
-        if verdict.verdict != "PASS":
-            parts.append(f"critic_{verdict.verdict.lower()}")
-        return ", ".join(parts) or "unknown"
-
     # ------------------------------------------------------------------
     # Execution (shared between iterations)
     # ------------------------------------------------------------------
@@ -1439,6 +1522,7 @@ class Orchestrator:
         stage_id: str,
         metadata: dict[str, Any],
         spec: DynamicPlannerSpec,
+        stage_default_model_id: str | None = None,
     ) -> PlannerOutcome:
         """Run planner backend and return a validated planner result."""
         catalog_hash = self._operator_catalog.catalog_hash()
@@ -1474,6 +1558,7 @@ class Orchestrator:
                 "operator_catalog_hash": catalog_hash,
                 "allowed_capabilities": request.allowed_capabilities,
             },
+            decision_type=DecisionType.PLANNING,
         )
 
         backend = get_planner_backend(spec.backend_name)
@@ -1485,7 +1570,14 @@ class Orchestrator:
                 recorder,
                 replay_provider=replay_provider,
                 initial_inputs_override=initial_inputs,
-                suppress_node_events=suppress_node_events,
+                # Planner backends may request suppression for noisy internal graphs
+                # (extraction/clarification). However, if a trace event listener is
+                # attached (e.g. CLI --demo-live), show all node lifecycle events
+                # to avoid "silent" long waits in COMMIT.
+                suppress_node_events=(
+                    suppress_node_events and self._trace_event_listener is None
+                ),
+                stage_default_model_id=stage_default_model_id,
             ),
         )
         if isinstance(result, PlannerEscalation):
@@ -1512,6 +1604,7 @@ class Orchestrator:
                     "evidence_artifact_ids": final_escalation.evidence_artifact_ids,
                     "operator_catalog_hash": final_escalation.operator_catalog_hash,
                 },
+                decision_type=DecisionType.ESCALATION,
             )
             return final_escalation
         validated = validate_planned_graph(
@@ -1546,6 +1639,7 @@ class Orchestrator:
                     else 0
                 ),
             },
+            decision_type=DecisionType.PLANNING,
         )
         return final_result
 
@@ -1556,6 +1650,7 @@ class Orchestrator:
         recorder: TraceRecorder,
         iteration: int,
         runbook_id: str,
+        metadata: dict[str, Any],
         stage_id: str,
         stage_index: int,
         escalation: PlannerEscalation,
@@ -1575,6 +1670,7 @@ class Orchestrator:
                     for aid in escalation.evidence_artifact_ids
                 ],
             },
+            decision_type=DecisionType.ESCALATION,
         )
         recorder.record_decision(
             "Escalation requested",
@@ -1588,6 +1684,7 @@ class Orchestrator:
                 "missing_fields": list(escalation.missing_fields),
                 "evidence_artifact_ids": list(escalation.evidence_artifact_ids),
             },
+            decision_type=DecisionType.ESCALATION,
         )
         state.transition_to(
             RunState.PAUSED,
@@ -1601,6 +1698,7 @@ class Orchestrator:
             "paused",
             extra={
                 "runbook_id": runbook_id,
+                "metadata": metadata,
                 "stage_id": stage_id,
                 "stage_index": stage_index,
                 "clarification_request_artifact_id": escalation.clarification_request_artifact_id,
@@ -1621,9 +1719,12 @@ class Orchestrator:
         replay_provider: ReplayProvider | None = None,
         initial_inputs_override: dict[str, Any] | None = None,
         suppress_node_events: bool = False,
+        stage_default_model_id: str | None = None,
     ) -> dict[str, NodeOutput]:
         """Build node registry and execute the DAG."""
-        registry = self._build_node_registry(graph)
+        registry = self._build_node_registry(
+            graph, stage_default_model_id=stage_default_model_id
+        )
 
         # Enable recording for replay
         recordings: dict[str, list] = {}
@@ -1633,7 +1734,11 @@ class Orchestrator:
                     recordings[nid] = node.enable_recording()
         else:
             report = replay_provider.inject(registry, strict=True)
-            recorder.record_decision("Replay responses injected", report)
+            recorder.record_decision(
+                "Replay responses injected",
+                report,
+                decision_type=DecisionType.EXECUTION,
+            )
 
         def trace_cb(kind: str, payload: dict[str, Any]) -> None:
             if suppress_node_events and kind in {"node_start", "node_end"}:
@@ -1647,10 +1752,31 @@ class Orchestrator:
             trace_id=state.trace_id,
             random_seed=self.config.determinism.default_random_seed,
             trace_callback=trace_cb,
+            max_node_retries=self.config.recovery.max_node_retries,
+            retry_backoff_base_seconds=self.config.recovery.retry_backoff_base_seconds,
+            retry_count_upgrade_threshold=self.config.recovery.retry_count_upgrade_threshold,
+        )
+
+        # B11: determinism audit — record nodes that use seed and that seed is set
+        nodes_using_seed = [
+            nid
+            for nid, node in registry.items()
+            if node.get_determinism_contract().uses_seed
+        ]
+        recorder.record_determinism_audit(
+            nodes_using_seed=nodes_using_seed,
+            seed_value=self.config.determinism.default_random_seed,
+            seed_present=True,
         )
 
         objective = state.intention.objective  # type: ignore[union-attr]
-        constraints = state.intention.constraints  # type: ignore[union-attr]
+        raw_constraints = state.intention.constraints  # type: ignore[union-attr]
+        # Internal constraints are allowed for planning/control, but should not
+        # be shown to LLM prompts by default.
+        constraints = [
+            c for c in raw_constraints
+            if not (isinstance(c, str) and c.startswith("__NEURONIUM_INTERNAL_"))
+        ]
 
         base_inputs: dict[str, Any] = {
             "objective": objective,
@@ -1672,23 +1798,55 @@ class Orchestrator:
         return results
 
     def _build_node_registry(
-        self, graph: ActionGraph
+        self,
+        graph: ActionGraph,
+        *,
+        stage_default_model_id: str | None = None,
     ) -> dict[str, BaseNode]:
         """Instantiate concrete node implementations for each graph node."""
         registry: dict[str, BaseNode] = {}
         for gn in graph.nodes:
             if gn.node_type == "model":
+                # B13: resolve model from catalog (or default catalog) with fallback
+                effective_catalog = (
+                    self.config.model_catalog
+                    if self.config.model_catalog is not None
+                    else get_default_catalog(self.config.llm)
+                )
+                model_id = None
+                if isinstance(gn.parameters, dict):
+                    model_id = gn.parameters.get("model_id")
+                model_id = model_id or stage_default_model_id
+                resolved = resolve_model_for_node(
+                    effective_catalog,
+                    self.config.llm,
+                    model_id,
+                )
+                # Allow planner/internal graphs to override timeouts per node
+                timeout = self.config.llm.timeout_seconds
+                max_retries = self.config.llm.max_retries
+                if isinstance(gn.parameters, dict):
+                    if gn.parameters.get("timeout_seconds") is not None:
+                        try:
+                            timeout = int(gn.parameters["timeout_seconds"])
+                        except Exception:
+                            timeout = self.config.llm.timeout_seconds
+                    if gn.parameters.get("max_retries") is not None:
+                        try:
+                            max_retries = int(gn.parameters["max_retries"])
+                        except Exception:
+                            max_retries = self.config.llm.max_retries
                 registry[gn.node_id] = ModelNode(
                     node_id=gn.node_id,
                     parameters=gn.parameters,
-                    model=self.config.llm.model,
-                    provider=self.config.llm.provider,
-                    api_key_env=self.config.llm.api_key_env,
-                    base_url=self.config.llm.base_url,
+                    model=resolved.model,
+                    provider=resolved.provider,
+                    api_key_env=resolved.api_key_env,
+                    base_url=resolved.base_url,
                     structured_output=self.config.llm.structured_output,
                     temperature=self.config.determinism.llm_temperature,
-                    timeout=self.config.llm.timeout_seconds,
-                    max_retries=self.config.llm.max_retries,
+                    timeout=timeout,
+                    max_retries=max_retries,
                 )
             elif gn.node_type == "code":
                 dc = self.config.code_node.docker
@@ -1706,6 +1864,9 @@ class Orchestrator:
                 roots = []
                 if self.config.mcp.enabled:
                     roots = [os.getcwd()]
+                deterministic = True
+                if isinstance(gn.parameters, dict) and gn.parameters.get("deterministic") is False:
+                    deterministic = False
                 registry[gn.node_id] = McpToolNode(
                     node_id=gn.node_id,
                     parameters=gn.parameters,
@@ -1718,6 +1879,7 @@ class Orchestrator:
                         "fs_max_write_bytes": 1_000_000,
                     },
                     tool_runtime=self._build_tool_runtime(),
+                    deterministic=deterministic,
                 )
             elif gn.node_type == "decision":
                 from neuronium_agent.nodes.decision_node import DecisionNode
@@ -1738,6 +1900,16 @@ class Orchestrator:
                 registry[gn.node_id] = AggregateNode(
                     node_id=gn.node_id, parameters=gn.parameters
                 )
+        # B11: reject declared non-deterministic nodes when strict
+        if self.config.determinism.strict:
+            allowlist = set(self.config.determinism.mcp_allow_non_deterministic_tool_ids)
+            for nid, node in registry.items():
+                contract = node.get_determinism_contract()
+                if contract.declared_non_deterministic and nid not in allowlist:
+                    raise ConfigError(
+                        f"Determinism strict: node {nid!r} is declared non-deterministic; "
+                        "add to determinism.mcp_allow_non_deterministic_tool_ids or set strict=false"
+                    )
         return registry
 
     # ------------------------------------------------------------------
@@ -1774,13 +1946,46 @@ class Orchestrator:
         )
         return aid
 
+    def _finalize_run(
+        self,
+        state: AgentState,
+        recorder: TraceRecorder,
+        results: dict[str, NodeOutput],
+        runbook_id: str,
+        *,
+        rollback_node_ids: set[str] | None = None,
+    ) -> None:
+        """Single point of run finalization: persist artifacts + render + local index.
+
+        If results is empty, does nothing. Otherwise calls _persist_artifacts
+        and _persist_local_rendered_artifact (A3).
+        """
+        if not results:
+            return
+        self._persist_artifacts(
+            state, results, recorder, rollback_node_ids=rollback_node_ids
+        )
+        self._persist_local_rendered_artifact(
+            state=state,
+            recorder=recorder,
+            results=results,
+            runbook_id=runbook_id,
+        )
+
     def _persist_artifacts(
         self,
         state: AgentState,
         results: dict[str, NodeOutput],
         recorder: TraceRecorder,
+        *,
+        rollback_node_ids: set[str] | None = None,
     ) -> None:
-        """Persist node outputs as immutable artifacts."""
+        """Persist node outputs as immutable artifacts.
+
+        If rollback_node_ids is set, artifacts produced by those nodes are
+        marked deprecated for lineage (B1 Part 2 §3.4.1).
+        """
+        deprecated_aids: list[str] = []
         for nid, output in results.items():
             if output.status != "COMPLETED":
                 continue
@@ -1807,6 +2012,10 @@ class Orchestrator:
                 media_type="application/json",
                 size_bytes=len(content),
             )
+            if rollback_node_ids and nid in rollback_node_ids:
+                deprecated_aids.append(aid)
+        if deprecated_aids:
+            self.index_store.mark_artifacts_deprecated(deprecated_aids, "rollback")
 
     def _persist_local_rendered_artifact(
         self,
@@ -1858,6 +2067,7 @@ class Orchestrator:
                 "summary": user_summary.summary,
                 "source_url": user_summary.source_url,
             },
+            decision_type=DecisionType.EXECUTION,
         )
 
         index = LocalArtifactIndex(self.config.project.data_dir)
@@ -1878,4 +2088,5 @@ class Orchestrator:
                 "artifact_path_debug": debug_rendered.path,
                 "artifact_path_user": user_path,
             },
+            decision_type=DecisionType.EXECUTION,
         )

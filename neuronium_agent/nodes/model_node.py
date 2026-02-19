@@ -17,6 +17,7 @@ from neuronium_agent.nodes.base import (
     NodeOutput,
     QualitySignals,
 )
+from neuronium_agent.nodes.determinism import DeterminismContract
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,9 @@ class ModelNode(BaseNode):
         self.temperature = temperature
         self.timeout = timeout
         self.max_retries = max_retries
+
+    def get_determinism_contract(self) -> DeterminismContract:
+        return DeterminismContract(uses_seed=True, declared_non_deterministic=False)
 
     # -- Replay support ------------------------------------------------------
 

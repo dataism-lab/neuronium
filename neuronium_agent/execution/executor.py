@@ -15,9 +15,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from neuronium_agent.nodes.base import BaseNode, NodeContext, NodeInput, NodeOutput
+from neuronium_agent.nodes.decision_node import BRANCH_OUTPUT_KEY
 from neuronium_agent.planning.dag import ActionGraph
+from neuronium_agent.recovery.classifier import classify_failure
 
 logger = logging.getLogger(__name__)
+
+_MAX_RETRY_DELAY_SECONDS = 60.0
 
 
 class DAGExecutor:
@@ -43,6 +47,9 @@ class DAGExecutor:
         trace_id: str | None = None,
         random_seed: int = 0,
         trace_callback: Any | None = None,
+        max_node_retries: int = 3,
+        retry_backoff_base_seconds: float = 1.0,
+        retry_count_upgrade_threshold: int = 2,
     ) -> None:
         self._registry = node_registry
         self._max_parallel = max_parallel
@@ -50,6 +57,9 @@ class DAGExecutor:
         self._trace_id = trace_id or uuid.uuid4().hex
         self._seed = random_seed
         self._trace_cb = trace_callback
+        self._max_node_retries = max_node_retries
+        self._retry_backoff_base = retry_backoff_base_seconds
+        self._retry_count_upgrade_threshold = retry_count_upgrade_threshold
 
         # Stores outputs keyed by node_id
         self.results: dict[str, NodeOutput] = {}
@@ -64,33 +74,51 @@ class DAGExecutor:
         *,
         initial_inputs: dict[str, Any] | None = None,
     ) -> dict[str, NodeOutput]:
-        """Run the full DAG and return ``{node_id: NodeOutput}``."""
+        """Run the full DAG and return ``{node_id: NodeOutput}``.
+
+        Respects conditional branches (B3): when a decision node completes,
+        its output branch value is recorded; nodes in unselected branches
+        are never added to ready and are skipped.
+        """
         initial_inputs = initial_inputs or {}
         order = graph.topological_order()
-        adj = graph.adjacency()
         preds = graph.predecessors()
         nmap = graph.node_map()
 
-        # Track completed set for parallel scheduling
+        # decision_node_id -> selected branch value (matches ConditionalBranch.branch_label)
+        selected_branches: dict[str, str] = {}
+
         completed: set[str] = set()
         pending = list(order)
 
         while pending:
-            # Find "ready" nodes: all predecessors completed
-            ready = [
+            # Ready: all predecessors completed and not in an unselected branch
+            preds_satisfied = [
                 nid
                 for nid in pending
                 if all(p in completed for p in preds.get(nid, []))
             ]
-            if not ready:
-                raise RuntimeError(
-                    "Deadlock: no ready nodes but pending remains"
-                )
+            ready = [
+                nid
+                for nid in preds_satisfied
+                if not _is_in_unselected_branch(nid, graph, selected_branches)
+            ]
+            # Skipped: preds satisfied but in unselected branch — remove from pending
+            # so the loop terminates (they are never executed, not added to results)
+            skipped = [nid for nid in preds_satisfied if nid not in ready]
+            for nid in skipped:
+                pending.remove(nid)
+                completed.add(nid)
 
-            # Sort for determinism
+            if not ready:
+                if pending:
+                    raise RuntimeError(
+                        "Deadlock: no ready nodes but pending remains"
+                    )
+                break
+
             ready.sort(key=lambda nid: (nmap[nid].priority, nid))
 
-            # Execute batch (up to max_parallel)
             batch = ready[: self._max_parallel]
             batch_results = self._execute_batch(
                 batch,
@@ -102,6 +130,20 @@ class DAGExecutor:
                 self.results[nid] = output
                 completed.add(nid)
                 pending.remove(nid)
+                # Record branch selection for decision nodes (B3)
+                gn = nmap.get(nid)
+                if gn and gn.node_type == "decision" and output.status == "COMPLETED":
+                    branch_key = (gn.parameters or {}).get(
+                        "branch_output_key", BRANCH_OUTPUT_KEY
+                    )
+                    branch_value = output.outputs.get(branch_key)
+                    if branch_value is not None:
+                        selected_branches[nid] = str(branch_value)
+                        self._emit("decision_branch_selected", {
+                            "node_id": nid,
+                            "branch_value": branch_value,
+                            "branch_label": branch_value,
+                        })
 
         return self.results
 
@@ -153,101 +195,183 @@ class DAGExecutor:
         *,
         initial_inputs: dict[str, Any],
     ) -> NodeOutput:
-        """Execute a single node, emitting trace events."""
+        """Execute a single node with retry for TRANSIENT failures, emitting trace events."""
         node_impl = self._registry.get(node_id)
         nmap = graph.node_map()
         graph_node = nmap.get(node_id)
 
         if node_impl is None:
             logger.error("No implementation for node %s", node_id)
-            return NodeOutput(
+            out = NodeOutput(
                 status="FAILED",
                 error=f"No implementation registered for node {node_id}",
             )
+            fc = classify_failure(
+                node_id, "unknown", "FAILED", out.error, 0,
+                retry_count_upgrade_threshold=self._retry_count_upgrade_threshold,
+            )
+            return out.model_copy(update={"failure_class": fc})
 
         preds = graph.predecessors()
-        # Gather inputs from predecessor outputs
+        inputs = self._gather_inputs(node_id, graph, graph_node, initial_inputs)
+        node_ref = (
+            f"{self._execution_id}:{graph.metadata.plan_id}"
+            f"/execute/{node_id}"
+        )
+        node_type = graph_node.node_type if graph_node else "unknown"
+
+        attempt = 0
+        while True:
+            ctx = NodeContext(
+                execution_id=self._execution_id,
+                trace_id=self._trace_id,
+                retry_count=attempt,
+                random_seed=self._seed,
+            )
+            node_input = NodeInput(
+                inputs=inputs,
+                parameters=graph_node.parameters if graph_node else {},
+                context=ctx,
+            )
+
+            self._emit("node_start", {
+                "node_id": node_id,
+                "node_ref": node_ref,
+                "node_type": node_type,
+                "inputs": inputs,
+                "parameters": graph_node.parameters if graph_node else {},
+            })
+
+            started = time.perf_counter()
+            try:
+                output = node_impl.execute(node_input)
+            except Exception as exc:
+                output = NodeOutput(status="FAILED", error=str(exc))
+
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+
+            if output.status == "COMPLETED":
+                self._emit("node_end", {
+                    "node_id": node_id,
+                    "node_ref": node_ref,
+                    "status": output.status,
+                    "outputs": output.outputs,
+                    "error": output.error,
+                    "quality_signals": output.quality_signals.model_dump(mode="json"),
+                    "elapsed_ms": elapsed_ms,
+                })
+                return output
+
+            # Classify failure and attach to output
+            fc = classify_failure(
+                node_id,
+                node_type,
+                output.status,
+                output.error,
+                attempt,
+                retry_count_upgrade_threshold=self._retry_count_upgrade_threshold,
+            )
+            output = output.model_copy(update={"failure_class": fc})
+
+            if fc.kind == "CRITICAL":
+                self._emit("node_failure_critical", {
+                    "node_id": node_id,
+                    "node_ref": node_ref,
+                    "failure_class": fc.kind,
+                    "message": fc.message,
+                })
+
+            self._emit("node_end", {
+                "node_id": node_id,
+                "node_ref": node_ref,
+                "status": output.status,
+                "outputs": output.outputs,
+                "error": output.error,
+                "quality_signals": output.quality_signals.model_dump(mode="json"),
+                "elapsed_ms": elapsed_ms,
+            })
+
+            if fc.kind == "CRITICAL" or not fc.retryable:
+                return output
+
+            if attempt >= self._max_node_retries:
+                return output
+
+            delay = min(
+                self._retry_backoff_base * (2**attempt),
+                _MAX_RETRY_DELAY_SECONDS,
+            )
+            self._emit("node_retry", {
+                "node_id": node_id,
+                "node_ref": node_ref,
+                "retry_count": attempt + 1,
+                "reason": fc.message or "Transient failure",
+            })
+            time.sleep(delay)
+            attempt += 1
+
+    def _gather_inputs(
+        self,
+        node_id: str,
+        graph: ActionGraph,
+        graph_node: Any,
+        initial_inputs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Build inputs dict for a node from predecessors and initial_inputs."""
+        preds = graph.predecessors()
         inputs: dict[str, Any] = {}
         for pred_id in preds.get(node_id, []):
             pred_output = self.results.get(pred_id)
             if pred_output:
                 inputs.update(pred_output.outputs)
-
-        # Inject initial inputs for all nodes (as defaults).
-        # Upstream outputs always win because we use setdefault().
         for k, v in initial_inputs.items():
             inputs.setdefault(k, v)
 
-        # Inject "prompt" for ModelNode from objective if not present
         if graph_node and graph_node.node_type == "model" and "prompt" not in inputs:
-            # Critic nodes have a json_schema parameter — build a structured
-            # evaluation prompt from all available inputs.
             if graph_node.parameters.get("json_schema"):
                 inputs["prompt"] = _build_critic_prompt(
-                    inputs,
-                    parameters=graph_node.parameters,
+                    inputs, parameters=graph_node.parameters
                 )
             elif inputs.get("previous_code"):
-                # Fix node — build prompt with error context
                 inputs["prompt"] = _build_fix_prompt(inputs)
             else:
                 inputs["prompt"] = _build_default_prompt(inputs)
 
-        # For CodeNode: use "content" from ModelNode output as "code"
         if graph_node and graph_node.node_type == "code" and "code" not in inputs:
             if "content" in inputs:
                 inputs["code"] = inputs["content"]
 
-        node_ref = (
-            f"{self._execution_id}:{graph.metadata.plan_id}"
-            f"/execute/{node_id}"
-        )
-
-        ctx = NodeContext(
-            execution_id=self._execution_id,
-            trace_id=self._trace_id,
-            retry_count=0,
-            random_seed=self._seed,
-        )
-
-        node_input = NodeInput(
-            inputs=inputs,
-            parameters=graph_node.parameters if graph_node else {},
-            context=ctx,
-        )
-
-        # Emit node_start
-        started = time.perf_counter()
-        self._emit("node_start", {
-            "node_id": node_id,
-            "node_ref": node_ref,
-            "node_type": graph_node.node_type if graph_node else "unknown",
-            "inputs": inputs,
-            "parameters": graph_node.parameters if graph_node else {},
-        })
-
-        try:
-            output = node_impl.execute(node_input)
-        except Exception as exc:
-            output = NodeOutput(status="FAILED", error=str(exc))
-
-        # Emit node_end
-        elapsed_ms = int((time.perf_counter() - started) * 1000)
-        self._emit("node_end", {
-            "node_id": node_id,
-            "node_ref": node_ref,
-            "status": output.status,
-            "outputs": output.outputs,
-            "error": output.error,
-            "quality_signals": output.quality_signals.model_dump(mode="json"),
-            "elapsed_ms": elapsed_ms,
-        })
-
-        return output
+        return inputs
 
     def _emit(self, kind: str, payload: dict[str, Any]) -> None:
         if self._trace_cb:
             self._trace_cb(kind, payload)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (B3 conditional branches)
+# ---------------------------------------------------------------------------
+
+def _is_in_unselected_branch(
+    node_id: str,
+    graph: ActionGraph,
+    selected_branches: dict[str, str],
+) -> bool:
+    """True if node is in a conditional branch that was not selected.
+
+    A node is excluded from ready when it belongs to some ConditionalBranch
+    whose decision node has already completed and selected a different
+    branch_label.
+    """
+    for cb in graph.conditional_branches:
+        if node_id not in cb.target_node_ids:
+            continue
+        sel = selected_branches.get(cb.decision_node_id)
+        if sel is None:
+            continue
+        if sel != cb.branch_label:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +451,11 @@ def _build_critic_prompt(
 
 
 def _build_fix_prompt(inputs: dict[str, Any]) -> str:
-    """Build a prompt for the fix ModelNode from iteration 1 failure context."""
+    """Build a prompt for the fix ModelNode from iteration 1 failure context.
+
+    B2: if ``verdict_fix`` is present, uses its gaps and suggestions in addition
+    to (or instead of) ``previous_gaps``.
+    """
     parts: list[str] = []
 
     objective = inputs.get("objective", "")
@@ -350,9 +478,25 @@ def _build_fix_prompt(inputs: dict[str, Any]) -> str:
     if exit_code is not None:
         parts.append(f"EXIT_CODE: {exit_code}")
 
-    gaps = inputs.get("previous_gaps", [])
+    verdict_fix = inputs.get("verdict_fix")
+    if isinstance(verdict_fix, dict):
+        gaps = verdict_fix.get("gaps") or inputs.get("previous_gaps", [])
+        suggestions = verdict_fix.get("suggestions") or []
+    else:
+        gaps = inputs.get("previous_gaps", [])
+        suggestions = []
+
     if gaps:
-        parts.append(f"GAPS IDENTIFIED BY CRITIC:\n" + "\n".join(f"- {g}" for g in gaps))
+        parts.append("GAPS IDENTIFIED BY CRITIC:\n" + "\n".join(f"- {g}" for g in gaps))
+    if suggestions:
+        parts.append("SUGGESTIONS:")
+        for s in suggestions:
+            if isinstance(s, dict):
+                action = s.get("action", "")
+                expected = s.get("expected_improvement", s.get("expectedImprovement", ""))
+                parts.append(f"- {action}" + (f" (expected: {expected})" if expected else ""))
+            else:
+                parts.append(f"- {s}")
 
     parts.append(
         "Fix the code above.  Make the MINIMAL change to resolve the error.  "
@@ -367,15 +511,19 @@ def _build_default_prompt(inputs: dict[str, Any]) -> str:
 
     Keeps backward compatibility for the simplest case:
     - If only ``objective`` is present, returns it unchanged.
+    B2: when ``verdict_fix`` is present (gaps/suggestions from critic), adds
+    a PREVIOUS ATTEMPT FEEDBACK section.
     """
     objective = str(inputs.get("objective", "") or "")
     constraints = inputs.get("constraints")
 
-    skip = {"prompt", "objective", "constraints"}
+    skip = {"prompt", "objective", "constraints", "verdict_fix"}
     extra_keys = sorted([k for k in inputs.keys() if k not in skip])
 
     has_constraints = bool(constraints)
-    if objective and not has_constraints and not extra_keys:
+    verdict_fix = inputs.get("verdict_fix")
+    has_verdict_fix = isinstance(verdict_fix, dict) and verdict_fix
+    if objective and not has_constraints and not extra_keys and not has_verdict_fix:
         return objective
 
     parts: list[str] = []
@@ -388,6 +536,30 @@ def _build_default_prompt(inputs: dict[str, Any]) -> str:
         else:
             ctext = str(constraints)
         parts.append(f"CONSTRAINTS:\n{ctext}")
+
+    if has_verdict_fix:
+        parts.append("PREVIOUS ATTEMPT FEEDBACK (address these to pass the gate):")
+        gaps = verdict_fix.get("gaps") or []
+        if gaps:
+            parts.append("Gaps identified:")
+            for g in gaps:
+                parts.append(f"- {g}")
+        suggestions = verdict_fix.get("suggestions") or []
+        if suggestions:
+            parts.append("Suggestions:")
+            for s in suggestions:
+                if isinstance(s, dict):
+                    action = s.get("action", "")
+                    expected = s.get("expected_improvement", s.get("expectedImprovement", ""))
+                    effort = s.get("effort_estimate", s.get("effortEstimate", ""))
+                    line = f"- {action}"
+                    if expected:
+                        line += f" (expected: {expected})"
+                    if effort:
+                        line += f" [effort: {effort}]"
+                    parts.append(line)
+                else:
+                    parts.append(f"- {s}")
 
     if extra_keys:
         parts.append("CONTEXT:")

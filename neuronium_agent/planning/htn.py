@@ -29,10 +29,27 @@ from neuronium_agent.verification.demo_critic import (
 
 # -- Shared constants --------------------------------------------------------
 
+_INTERNAL_DEMO_INJECT_BUG_CONSTRAINT = "__NEURONIUM_INTERNAL_DEMO_INJECT_BUG__"
+
 _CODE_GEN_SYSTEM_PROMPT = (
     "You are a Python code generator.  "
     "Given the user's objective, produce ONLY valid Python code "
     "that accomplishes the task.  Output ONLY the code, no explanation."
+)
+
+_CODE_GEN_INJECT_BUG_SYSTEM_PROMPT = (
+    "You are a Python code generator for a controlled demo.\n"
+    "Given the user's objective, produce Python code that attempts to accomplish it,\n"
+    "BUT intentionally include ONE small runtime bug that makes execution fail.\n\n"
+    "Rules:\n"
+    "- The bug must be a simple, obvious runtime error (e.g. NameError).\n"
+    "- Do NOT add any extra output beyond what the objective requires.\n"
+    "- If the objective involves printing an exact output, print the intended output FIRST,\n"
+    "  then trigger the runtime error AFTER WITHOUT printing anything else (so stdout proves partial progress).\n"
+    "- Preferred pattern: after producing the correct output, add a single line that triggers NameError,\n"
+    "  e.g. `demo_trigger()` (undefined) or `raise NameError('demo')`.\n"
+    "- Do NOT introduce multiple bugs.\n"
+    "- Output ONLY the code, no explanation."
 )
 
 _CODE_FIX_SYSTEM_PROMPT = (
@@ -42,6 +59,8 @@ _CODE_FIX_SYSTEM_PROMPT = (
     "- Make the MINIMAL change required — do not refactor, rename "
     "unrelated symbols, reorganize code, add new features, or change "
     "logic outside the smallest necessary scope.\n"
+    "- The corrected program MUST satisfy the user's objective. If the objective requires EXACT output,\n"
+    "  ensure stdout matches EXACTLY and remove any extra prints/debug lines.\n"
     "- Preserve formatting and structure unless directly required to "
     "fix the error.\n"
     "- Output ONLY the corrected code, no explanation."
@@ -84,12 +103,23 @@ class HTNPlanner:
         both the code and the execution result.
         """
         pid = plan_id or f"plan-iter1-{uuid.uuid4().hex[:12]}"
+        constraints = constraints or []
+        inject_bug = any(
+            isinstance(c, str) and _INTERNAL_DEMO_INJECT_BUG_CONSTRAINT in c
+            for c in constraints
+        )
 
         generate_node = GraphNode(
             node_id="generate",
             node_type="model",
             label="Generate Python code from objective",
-            parameters={"system_prompt": _CODE_GEN_SYSTEM_PROMPT},
+            parameters={
+                "system_prompt": (
+                    _CODE_GEN_INJECT_BUG_SYSTEM_PROMPT
+                    if inject_bug
+                    else _CODE_GEN_SYSTEM_PROMPT
+                )
+            },
             priority=0,
         )
 

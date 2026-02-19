@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from neuronium_agent._canonical import canonical_json
 from neuronium_agent.storage.index_store import IndexStore
+from neuronium_agent.trace.decision_record import DecisionRecord, DecisionType
 
 
 class TraceRecorder:
@@ -108,11 +109,53 @@ class TraceRecorder:
             span_id=span_id,
         )
 
-    def record_decision(self, description: str, details: dict[str, Any]) -> None:
-        self.record("decision", {"description": description, **details})
+    def record_decision(
+        self,
+        description: str,
+        details: dict[str, Any] | None = None,
+        *,
+        record: DecisionRecord | None = None,
+        decision_type: DecisionType | None = None,
+    ) -> None:
+        """Record a decision event. Uses formal DecisionRecord when record= or builds one from (description, details).
+
+        Backward compatible: callers can keep using record_decision(description, details).
+        All events get a decisionRecord in payload (full or from_legacy) per §10.1.1.
+        """
+        details = details or {}
+        if record is not None:
+            desc = record.selected_option.selection_rationale
+            dr = record.to_payload()["decisionRecord"]
+            if record.trace_id is None:
+                dr = {**dr, "traceId": self.trace_id}
+            payload = {"description": desc, **details, "decisionRecord": dr}
+        else:
+            dt = decision_type or DecisionType.CONTROL
+            rec = DecisionRecord.from_legacy(description, details, decision_type=dt)
+            dr = rec.to_payload()["decisionRecord"]
+            dr = {**dr, "traceId": self.trace_id}
+            payload = {"description": description, **details, "decisionRecord": dr}
+        self.record("decision", payload)
 
     def record_checkpoint(self, state_snapshot: dict[str, Any]) -> None:
         self.record("checkpoint", state_snapshot)
+
+    def record_determinism_audit(
+        self,
+        nodes_using_seed: list[str],
+        seed_value: int,
+        *,
+        seed_present: bool = True,
+    ) -> None:
+        """Record B11 determinism audit: which nodes use seed and that seed is set (Spec §1.2.1)."""
+        self.record(
+            "determinism_audit",
+            {
+                "nodes_using_seed": nodes_using_seed,
+                "seed_value": seed_value,
+                "seed_present": seed_present,
+            },
+        )
 
     # ------------------------------------------------------------------
     # Query

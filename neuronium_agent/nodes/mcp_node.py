@@ -19,6 +19,7 @@ from neuronium_agent.nodes.base import (
     NodeOutput,
     QualitySignals,
 )
+from neuronium_agent.nodes.determinism import DeterminismContract
 from neuronium_agent.tools.local_tools import (
     ToolCall,
     ToolExecutionError,
@@ -47,6 +48,7 @@ class McpToolNode(BaseNode):
         timeout_seconds: int = 60,
         policy: dict[str, Any] | None = None,
         tool_runtime: Any | None = None,
+        deterministic: bool = True,
     ) -> None:
         super().__init__(node_id, parameters)
         self.server_name = server_name
@@ -54,11 +56,18 @@ class McpToolNode(BaseNode):
         self.timeout_seconds = timeout_seconds
         self.policy = policy or {}
         self.tool_runtime = tool_runtime
+        self._declared_non_deterministic = not deterministic
 
     # -- Replay ---------------------------------------------------------------
     _replay_responses: list[dict[str, Any]] | None = None
     _replay_index: int = 0
     _recorded_responses: list[dict[str, Any]] | None = None
+
+    def get_determinism_contract(self) -> DeterminismContract:
+        return DeterminismContract(
+            uses_seed=False,
+            declared_non_deterministic=self._declared_non_deterministic,
+        )
 
     def set_replay_responses(self, responses: list[dict[str, Any]]) -> None:
         self._replay_responses = list(responses)

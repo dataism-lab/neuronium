@@ -56,6 +56,8 @@ Binding: конфиг — это **вход** для `create_runner(config)` и 
 - `canonical_json: str` (enum, default: `"neuronium-v1"`) — версия canonicalization правил
 - `default_random_seed: int` (default: `0`)
 - `llm_temperature: float` (default: `0.0`)
+- `strict: bool` (default: `false`) — при `true` ноды с `declared_non_deterministic` отклоняются при сборке реестра (Spec §1.2.1)
+- `mcp_allow_non_deterministic_tool_ids: list[str]` (default: `[]`) — при `strict=true` разрешённые идентификаторы MCP-инструментов, считающихся недетерминистичными (allowlist)
 
 ### 2.3 `runtime`
 - `mode: str` (enum: `"batch" | "supervised"`, default: `"batch"`)
@@ -102,6 +104,25 @@ Binding: конфиг — это **вход** для `create_runner(config)` и 
 Binding: провайдеры — это настройка **ModelNode** (LLM inference). Исполнение графа (executor) от провайдера не зависит.
 
 Примечание: значение API key берётся из env var с именем `api_key_env`.
+
+### 2.6.1 `model_catalog` (опционально, B13)
+
+Каталог моделей для привязки model-нод к конкретной модели (Spec §5.2.1). Если секция не задана, используется внутренний дефолт (одна запись `default` из `llm`), поведение совпадает с текущим (все ноды — `llm.model` / `llm.provider`).
+
+- `default_model_id: str` (default: `"default"`) — идентификатор модели по умолчанию при отсутствии или недоступности выбранной по `model_id` в параметрах ноды
+- `models: list[entry]` (default: `[]`)
+
+`entry`:
+- `id: str` — идентификатор записи (например `"default"`, `"gpt4"`, `"critic"`)
+- `provider: str` (default: `"openai"`)
+- `model: str` — имя модели у провайдера (например `"gpt-4.1-mini"`)
+- `api_key_env: str|null` (default: `null`) — если задан, используется этот env для API key; иначе наследуется `llm.api_key_env`
+- `base_url: str|null` (default: `null`)
+- `description: str|null` (default: `null`) — описание для документации
+
+Поведение: при сборке реестра нод для каждой model-ноды читается `parameters.model_id`. Если в графе не задан `model_id`, используется дефолт стадии runbook (`ActionGraphStage.default_model_id`), если он задан. По итоговому id ищется запись в каталоге; если модель «доступна» (в env задан непустой ключ для `api_key_env`), используется она; иначе — запись с `default_model_id`; если и она недоступна — fallback на `llm.model` / `llm.provider` / `llm.api_key_env`.
+
+Env (при необходимости): `NEURONIUM_MODEL_CATALOG_DEFAULT_MODEL_ID` для переопределения дефолтной модели каталога (если в TOML задана секция `model_catalog`).
 
 ### 2.7 `mcp`
 - `enabled: bool` (default: `true`)
@@ -153,6 +174,18 @@ Binding: если `semantic_search.enabled=false`, запросы `mode=semantic
 - `json: bool` (default: `true`)
 - `path: str` (default: `"{project.data_dir}/logs/neuronium.jsonl"`)
 
+### 2.11 `recovery`
+Политика повторов и эскалации (B1 Part 1/2, B2 verdict local fix).
+- `max_node_retries: int` (default: `3`)
+- `max_stage_retries: int` (default: `2`)
+- `retry_backoff_base_seconds: float` (default: `1.0`)
+- `retry_count_upgrade_threshold: int` (default: `2`) — после стольких повторов ноды классификация → PERSISTENT
+- `repeated_rollback_threshold: int` (default: `3`) — при стольких повторных сбоях одной ноды → escalate
+- `allow_auto_replan: bool` (default: `false`) — при `true` политика может вернуть REPLAN вместо ESCALATE
+- `max_verdict_fix_attempts: int` (default: `1`) — макс. повторов стадии с контекстом verdict fix (gaps/suggestions)
+
+Env (при необходимости): `NEURONIUM_RECOVERY_MAX_NODE_RETRIES`, `NEURONIUM_RECOVERY_MAX_STAGE_RETRIES`, `NEURONIUM_RECOVERY_MAX_VERDICT_FIX_ATTEMPTS`.
+
 ---
 
 ## 3. Environment variables (binding)
@@ -166,6 +199,7 @@ Binding: если `semantic_search.enabled=false`, запросы `mode=semantic
 - `NEURONIUM_QUEUE_ENABLED=true`
 - `NEURONIUM_QUEUE_REDIS_URL=redis://...`
 - `NEURONIUM_OPENAI_API_KEY=...` (или другое имя, указанное в `llm.api_key_env`)
+- `NEURONIUM_RECOVERY_MAX_NODE_RETRIES`, `NEURONIUM_RECOVERY_MAX_STAGE_RETRIES`, `NEURONIUM_RECOVERY_MAX_VERDICT_FIX_ATTEMPTS`
 
 ---
 

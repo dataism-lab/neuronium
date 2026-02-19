@@ -100,6 +100,7 @@ def _seed_run_with_checkpoint(
         phase_boundary=phase_boundary,
         extra={
             "runbook_id": "docs_report_v1",
+            "metadata": {"runbook_id": "docs_report_v1", "doc_paths": ["/tmp/a.md"]},
             "stage_id": "docs_report_v1:stage1",
             "stage_index": 0,
             "gate_snapshot": gate_snapshot,
@@ -128,7 +129,7 @@ class TestResumeDispatch:
     def test_resume_infers_docs_report_v1(
         self, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Resume for docs_report_v1 should not call _run_cycle (autofix)."""
+        """Resume for docs_report_v1 uses _run_runbook with runbook_id docs_report_v1."""
         runner = _make_runner(tmp_dir, monkeypatch)
 
         gate_snapshot = {
@@ -202,9 +203,7 @@ class TestBestEffortResume:
     def test_resume_with_failing_gate_snapshot(
         self, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Resume with a FAIL gate snapshot should produce FAILED without
-        calling _execute.
-        """
+        """Resume with a FAIL gate snapshot: no _execute call; B1 recovery → PAUSED (ESCALATE)."""
         runner = _make_runner(tmp_dir, monkeypatch)
 
         gate_snapshot = {
@@ -228,7 +227,8 @@ class TestBestEffortResume:
         status = runner.get_status(handle)
 
         assert call_count["n"] == 0
-        assert status.state == "FAILED"
+        # B1 Part 1: critic-only failure → decide_recovery → ESCALATE → PAUSED (not FAILED)
+        assert status.state == "PAUSED"
 
     def test_resume_from_after_control_skips_execute_and_control(
         self, tmp_dir: Path, monkeypatch: pytest.MonkeyPatch,

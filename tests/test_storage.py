@@ -104,6 +104,28 @@ class TestSqliteIndexStore:
         assert art is not None
         assert art["artifact_type"] == "test_output"
 
+    def test_mark_artifacts_deprecated(self, index_store: SqliteIndexStore) -> None:
+        """B1 Part 2: deprecated_at set after mark_artifacts_deprecated."""
+        now = datetime.now(timezone.utc).isoformat()
+        index_store.record_artifact_metadata(
+            artifact_id="sha256:deprecate_me",
+            artifact_type="test",
+            created_at=now,
+            produced_by_node_ref="exec:plan/execute/n1",
+            inputs_json="[]",
+            quality_signals_json="{}",
+            blob_key="sha256:deprecate_me",
+            media_type="application/json",
+            size_bytes=0,
+        )
+        art = index_store.get_artifact("sha256:deprecate_me")
+        assert art is not None
+        assert art.get("deprecated_at") is None
+        index_store.mark_artifacts_deprecated(["sha256:deprecate_me"], "rollback")
+        art2 = index_store.get_artifact("sha256:deprecate_me")
+        assert art2 is not None
+        assert art2.get("deprecated_at") is not None
+
     def test_record_lineage_edge(self, index_store: SqliteIndexStore) -> None:
         index_store.record_lineage_edge("parent1", "child1", "producedFrom")
         # Idempotent — should not raise

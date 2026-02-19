@@ -71,8 +71,8 @@ class TestAgentRunnerWithReplay:
         # Monkey-patch the orchestrator to inject replay into nodes
         orig_build = runner._orchestrator._build_node_registry
 
-        def patched_build(graph):
-            registry = orig_build(graph)
+        def patched_build(graph, *, stage_default_model_id=None, **kwargs):
+            registry = orig_build(graph, stage_default_model_id=stage_default_model_id, **kwargs)
             for nid, node in registry.items():
                 if hasattr(node, "set_replay_responses") and nid in _ITER1_RESPONSES:
                     node.set_replay_responses(_ITER1_RESPONSES[nid])

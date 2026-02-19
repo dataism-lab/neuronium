@@ -12,10 +12,14 @@ from __future__ import annotations
 
 import abc
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from neuronium_agent.planning.dag import ActionGraph
 from neuronium_agent.planning.planner_contract import DynamicPlannerSpec
+
+# Result of graph_builder(context): either graph only, or (graph, initial_inputs_override)
+GraphBuilderResult = ActionGraph | tuple[ActionGraph, dict[str, Any] | None]
+GraphBuilder = Callable[[dict[str, Any]], GraphBuilderResult]
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +67,9 @@ class ActionGraphStage:
     stage_id:
         Stable identifier (e.g. ``"docs_report_v1:stage1"``).
     graph:
-        The ActionGraph (DAG) to execute in this stage.
+        The ActionGraph (DAG) to execute in this stage. Optional when
+        graph_builder is provided; then the orchestrator uses the graph
+        returned by graph_builder(context).
     initial_inputs_override:
         Extra key/value pairs injected as ``initial_inputs`` into the
         DAG executor (merged with objective/constraints).
@@ -72,13 +78,36 @@ class ActionGraphStage:
     dynamic_planner:
         Optional dynamic planner configuration. If provided, COMMIT runs a
         planner ModelNode that returns the stage graph at runtime.
+    graph_builder:
+        Optional callable(context) -> ActionGraph | (ActionGraph, dict|None).
+        If set, the orchestrator calls it with context (objective, constraints,
+        prev_stage_results, prev_stage_verdict, ...) and uses the returned
+        graph for this stage. If the return value is a tuple, the second
+        element is used as initial_inputs_override for this stage (merged
+        with initial_inputs_override).
+    exit_run_on_success:
+        If True, when this stage's gate passes the run completes (COMPLETED,
+        final checkpoint) and no further stages run. Used e.g. for autofix
+        iter1: on PASS we are done.
+    proceed_to_next_stage_on_fail:
+        If True, when this stage's gate fails the orchestrator does not enter
+        recovery; it proceeds to the next stage (prev_stage_results/verdict
+        set for graph_builder). Used e.g. for autofix iter1: on FAIL we run iter2.
+    default_model_id:
+        Optional model catalog id. If set, all model nodes in this stage that
+        do not have ``parameters["model_id"]`` in the graph use this id for
+        resolution (see CONFIG_SPEC §2.6.1).
     """
 
     stage_id: str
-    graph: ActionGraph
+    graph: ActionGraph | None = None
     initial_inputs_override: dict[str, Any] = field(default_factory=dict)
     success_gate: StageSuccessGate = field(default_factory=StageSuccessGate)
     dynamic_planner: DynamicPlannerSpec | None = None
+    graph_builder: GraphBuilder | None = None
+    exit_run_on_success: bool = False
+    proceed_to_next_stage_on_fail: bool = False
+    default_model_id: str | None = None
 
 
 # ---------------------------------------------------------------------------

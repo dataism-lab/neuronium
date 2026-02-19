@@ -46,12 +46,14 @@ def _ensure_builtins() -> None:
     _BUILTINS_LOADED = True
 
     # Import here to avoid circular imports at module level.
+    from neuronium_agent.planning.autofix_demo_runbook import AutofixDemoRunbook  # noqa: F811
     from neuronium_agent.planning.runbooks import DocsReportV1Runbook  # noqa: F811
     from neuronium_agent.planning.dynamic_planner_demo_runbook import DynamicPlannerDemoV1Runbook  # noqa: F811
     from neuronium_agent.planning.htn_recursive_demo_runbook import HtnRecursiveDemoV0Runbook  # noqa: F811
     from neuronium_agent.planning.super_agent_runbook import SuperAgentV0Runbook  # noqa: F811
     from neuronium_agent.planning.memory_runbook import HybridMemoryReportV1Runbook  # noqa: F811
 
+    register_runbook(AutofixDemoRunbook())
     register_runbook(DocsReportV1Runbook())
     register_runbook(DynamicPlannerDemoV1Runbook())
     register_runbook(HtnRecursiveDemoV0Runbook())

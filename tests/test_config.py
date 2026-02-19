@@ -25,8 +25,11 @@ class TestAppConfigDefaults:
         assert cfg.llm.model == "gpt-4.1-mini"
         assert cfg.determinism.llm_temperature == 0.0
         assert cfg.determinism.default_random_seed == 0
+        assert cfg.determinism.strict is False
+        assert cfg.determinism.mcp_allow_non_deterministic_tool_ids == []
         assert cfg.code_node.docker.network_enabled is False
         assert cfg.memory.semantic_search.enabled is False
+        assert cfg.model_catalog is None
 
 
 class TestConfigLoading:
@@ -71,3 +74,42 @@ sqlite_path = "/tmp/test/index.db"
         monkeypatch.setenv("NEURONIUM_RUNTIME_MODE", "supervised")
         cfg = load_config(cli_overrides={"runtime": {"mode": "batch"}})
         assert cfg.runtime.mode == "batch"
+
+    def test_determinism_strict_and_allowlist(self, tmp_path: Path) -> None:
+        toml_content = """
+[determinism]
+strict = true
+mcp_allow_non_deterministic_tool_ids = ["tool_a", "tool_b"]
+"""
+        toml_file = tmp_path / "neuronium.toml"
+        toml_file.write_text(toml_content, encoding="utf-8")
+        cfg = load_config(config_path=str(toml_file))
+        assert cfg.determinism.strict is True
+        assert cfg.determinism.mcp_allow_non_deterministic_tool_ids == ["tool_a", "tool_b"]
+
+    def test_model_catalog_load(self, tmp_path: Path) -> None:
+        toml_content = """
+[model_catalog]
+default_model_id = "default"
+
+[[model_catalog.models]]
+id = "default"
+provider = "openai"
+model = "gpt-4.1-mini"
+
+[[model_catalog.models]]
+id = "gpt4"
+provider = "openai"
+model = "gpt-4.1"
+description = "Larger model for complex tasks"
+"""
+        toml_file = tmp_path / "neuronium.toml"
+        toml_file.write_text(toml_content, encoding="utf-8")
+        cfg = load_config(config_path=str(toml_file))
+        assert cfg.model_catalog is not None
+        assert cfg.model_catalog.default_model_id == "default"
+        assert len(cfg.model_catalog.models) == 2
+        by_id = {m.id: m for m in cfg.model_catalog.models}
+        assert by_id["default"].model == "gpt-4.1-mini"
+        assert by_id["gpt4"].model == "gpt-4.1"
+        assert by_id["gpt4"].description == "Larger model for complex tasks"

@@ -30,11 +30,10 @@ def render_run_artifact(
     results: dict[str, NodeOutput],
 ) -> RenderedArtifact | None:
     """Render a deterministic HTML summary artifact from node outputs."""
-    completed = {
-        nid: out for nid, out in sorted(results.items())
-        if out.status == "COMPLETED"
-    }
-    if not completed:
+    # Debug renderer must help diagnose failures — include all nodes in a
+    # deterministic order (node_id sort), not only COMPLETED.
+    ordered = {nid: out for nid, out in sorted(results.items())}
+    if not ordered:
         return None
 
     now = datetime.now(timezone.utc)
@@ -49,8 +48,18 @@ def render_run_artifact(
     out_path = out_dir / file_name
 
     rows: list[str] = []
-    for nid, out in completed.items():
-        payload = json.dumps(out.outputs, ensure_ascii=False, sort_keys=True, indent=2)
+    for nid, out in ordered.items():
+        payload = json.dumps(
+            {
+                "status": out.status,
+                "outputs": out.outputs,
+                "error": out.error,
+                "quality_signals": out.quality_signals.model_dump(mode="json"),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+        )
         rows.append(
             "<section>"
             f"<h3>{escape(nid)}</h3>"

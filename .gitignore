@@ -10,16 +10,17 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
-uv.lock
+# uv.lock
 
 # Virtualenv
 .venv/
 
 # Neuronium runtime data
 .neuronium/
+out.jsonl
+trace.jsonl
 
 .cursor/
 .serena/
 
-out.jsonl
-trace.jsonl
+docs/internal/

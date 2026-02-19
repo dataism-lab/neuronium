@@ -122,6 +122,20 @@ class SqliteIndexStore(IndexStore):
         )
         return dict(row) if row else None
 
+    def mark_artifacts_deprecated(
+        self, artifact_ids: list[str], reason: str = "rollback"
+    ) -> None:
+        if not artifact_ids:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        placeholders = ",".join("?" for _ in artifact_ids)
+        with self._lock:
+            self._conn.execute(
+                f"UPDATE artifacts SET deprecated_at=? WHERE artifact_id IN ({placeholders})",
+                (now, *artifact_ids),
+            )
+            self._conn.commit()
+
     # -- lineage -------------------------------------------------------------
 
     def record_lineage_edge(

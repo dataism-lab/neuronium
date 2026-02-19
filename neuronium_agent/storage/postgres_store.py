@@ -156,6 +156,17 @@ class PostgresIndexStore(IndexStore):
         ).fetchone()
         return dict(row) if row else None  # type: ignore[arg-type]
 
+    def mark_artifacts_deprecated(
+        self, artifact_ids: list[str], reason: str = "rollback"
+    ) -> None:
+        if not artifact_ids:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        self._conn.execute(
+            "UPDATE artifacts SET deprecated_at=%s WHERE artifact_id = ANY(%s)",
+            (now, artifact_ids),
+        )
+
     # -- lineage -------------------------------------------------------------
 
     def record_lineage_edge(

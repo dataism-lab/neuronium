@@ -65,7 +65,7 @@
 
 ## Stage 5 — Memory: GraphRAG + agentic retrieval (обязательный этап)
 **Deliverables**
-- GraphRAG entity/relation storage (локально: SQLite).
+- GraphRAG entity/relation storage (локально: SQLite). *В v0.1 реализован вариант GraphRAG-lite: chunks + provenance + retrieval (keyword/hybrid); полный entity/relation граф — цель следующих итераций.*
 - Unified Query Interface.
 - Iterative retrieval loop state machine.
 - Provenance/evidence linking.
@@ -79,9 +79,7 @@
 ## Stage 6 — CLI runtime + тестирование + интеграции
 **Deliverables**
 - CLI: batch + supervised, trace export, resume from checkpoints.
-- Примеры:
-  - `docker-compose` для dev (Postgres/Redis опционально).
-  - интеграционный пример “web app → worker”.
+- Примеры (по мере появления): docker-compose для dev (Postgres/Redis), интеграционный пример “web app → worker”.
 - Тесты: determinism/replay, failure simulation.
 
 **Acceptance**
@@ -98,8 +96,4 @@
 - Local embeddings backend (sentence-transformers + local index).
 - SQL runtime для CodeNode (DuckDB или PG) — только если появятся кейсы.
 
----
-
-## Статус реализации (сверка)
-- См. `ROADMAP_STATUS.md`
 

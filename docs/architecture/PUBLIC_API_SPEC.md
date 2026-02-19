@@ -53,7 +53,7 @@ Internal-only (не считается public API):
   - `message: str | None`
 
 - `ControlCommand`
-  - `type: Literal["continue","pause","revise","replan","stop"]`
+  - `type: Literal["continue","pause","revise","replan","stop","escalate"]`
   - `payload: dict[str, Any] = {}`
 
 ### 2.2 Trace/export
@@ -79,9 +79,9 @@ Binding: `AgentRunner` не должен требовать Postgres/Redis дл�
 
 ### 3.2 Конструирование runner’а
 Создание runner’а выполняется через фабрику:
-- `create_runner(config: AppConfig) -> AgentRunner`
+- `create_runner(config: AppConfig | None = None, ...) -> AgentRunner`
 
-где `AppConfig` — pydantic-модель из `neuronium_agent.config`.
+Если `config` не передан (`None`), конфигурация загружается по умолчанию (TOML + env). `AppConfig` — pydantic-модель из `neuronium_agent.config`.
 
 ---
 
@@ -134,12 +134,13 @@ Binding: ошибки должны быть **детерминированно �
 CLI entrypoint: `neuronium-agent`
 
 Команды v1:
-- `run --objective "..."`
+- `run --objective "..."` (новый запуск) или `run --trace-id <id>` (продолжение с checkpoint)
   - `--config <path>`
+  - `--runbook <id>` (default: `super_agent_v0`)
   - `--mode batch|supervised`
   - `--trace-export <path>`
 - `status --trace-id <id>`
-- `control --trace-id <id> --command continue|pause|revise|replan|stop [--payload <json>]`
+- `control --trace-id <id> --command continue|pause|revise|replan|stop|escalate [--payload <json>]`
 - `replay --trace-id <id>` (может быть experimental/stub)
 - `worker` (если включён Redis+RQ)
 

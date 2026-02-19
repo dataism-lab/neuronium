@@ -1,25 +1,25 @@
 # NEURONIUM Agent — OSS library + CLI
 
-Commitment-aware AI Super Agent с планированием **Action Graph (DAG)**, гибридной памятью (GraphRAG + agentic retrieval), verification critics, typed contracts и audit/replay trace.
+Commitment-aware AI Super Agent with **Action Graph (DAG)** planning, hybrid memory (GraphRAG + agentic retrieval), verification critics, typed contracts, and audit/replay trace.
 
-## Быстрый старт (локально, без внешних сервисов)
+## Quick start (local, no external services)
 
-### 1. Установка
+### 1. Installation
 
 ```bash
-# Базовая установка (FS CAS + SQLite, OpenAI provider)
+# Base install (FS CAS + SQLite, OpenAI provider)
 pip install -e .
 
-# С Docker sandbox для CodeNode
+# With Docker sandbox for CodeNode
 pip install -e ".[docker]"
 
-# Все extras (Postgres, Redis, pgvector, embeddings, dev)
+# All extras (Postgres, Redis, pgvector, embeddings, dev)
 pip install -e ".[all]"
 ```
 
-### 2. Конфигурация
+### 2. Configuration
 
-Создайте `neuronium.toml` в корне проекта (или используйте дефолты):
+Create `neuronium.toml` in the project root (or rely on defaults):
 
 ```toml
 [project]
@@ -46,15 +46,15 @@ model = "gpt-4.1-mini"
 export NEURONIUM_OPENAI_API_KEY=sk-...
 ```
 
-Альтернатива (рекомендуется для локальной разработки): создайте `.env` в корне проекта:
+Alternatively (recommended for local development), create a `.env` file in the project root:
 
 ```dotenv
 NEURONIUM_OPENAI_API_KEY=sk-...
 ```
 
-CLI автоматически подхватит `.env` (не переопределяя уже заданные переменные окружения).
+The CLI loads `.env` automatically (without overriding already set environment variables).
 
-### 4. Запуск
+### 4. Run
 
 ```bash
 # CLI
@@ -76,7 +76,7 @@ runner.export_trace(handle, "jsonl", "trace.jsonl")
 
 ## Production: Postgres + Redis
 
-### 1. Установка extras
+### 1. Install extras
 
 ```bash
 pip install -e ".[postgres,redis]"
@@ -98,7 +98,7 @@ redis_url = "redis://localhost:6379/0"
 queue_name = "neuronium"
 ```
 
-### 3. Запуск worker
+### 3. Start worker
 
 ```bash
 neuronium-agent worker
@@ -106,24 +106,28 @@ neuronium-agent worker
 
 ---
 
-## Структура проекта
+## Project structure
 
 ```
 neuronium_agent/
-├── api.py              # Публичный фасад: AgentRunner, create_runner
-├── config.py           # Конфигурация (TOML + env + CLI)
-├── types.py            # Публичные DTO
-├── errors.py           # Иерархия ошибок
-├── _canonical.py       # Канонический JSON, artifact ID
+├── api.py              # Public facade: AgentRunner, create_runner
+├── config.py           # Configuration (TOML + env + CLI)
+├── types.py            # Public DTOs
+├── errors.py           # Error hierarchy
+├── _canonical.py       # Canonical JSON, artifact ID
 ├── core/               # State machine, orchestrator
 ├── planning/           # HTN → Action Graph (DAG)
-├── execution/          # Детерминированный DAG executor
+├── execution/          # Deterministic DAG executor
 ├── nodes/              # ModelNode, CodeNode, McpToolNode, ...
 ├── storage/            # Blob + Index store (FS CAS, SQLite, Postgres)
-│   └── migrations/     # SQL миграции (sqlite/, postgres/)
+│   └── migrations/     # SQL migrations (sqlite/, postgres/)
 ├── trace/              # Recorder, exporter, replay
-├── verification/       # Simulated critics
+├── verification/       # Critics (demo, generic, business)
 ├── memory/             # GraphRAG-lite (chunks + provenance, v0.2)
+├── artifacts/          # Artifact rendering, local index
+├── recovery/           # Recovery policy, classifier
+├── tools/              # MCP, web, export, memory tools
+├── schemas/            # Export schemas, registry
 ├── control/            # Control protocol
 ├── queue/              # Redis + RQ runner
 └── cli/                # CLI entrypoints
@@ -131,14 +135,15 @@ tests/
 ├── test_canonical.py   # Canonical JSON
 ├── test_config.py      # Config loading
 ├── test_storage.py     # FS CAS + SQLite
-├── test_determinism.py # Одинаковые входы → одинаковый trace
-├── test_immutability.py# Артефакты не модифицируются
-└── test_api.py         # Полный вертикальный срез
+├── test_determinism.py # Same inputs → same trace
+├── test_immutability.py# Artifacts are immutable
+├── test_api.py         # Full vertical slice
+└── ...                 # and other tests
 ```
 
 ---
 
-## Тесты
+## Tests
 
 ```bash
 pip install -e ".[dev]"
@@ -147,13 +152,14 @@ pytest tests/ -v
 
 ---
 
-## CLI команды
+## CLI commands
 
-| Команда | Описание |
-|---------|----------|
-| `neuronium-agent run --objective "..."` | Запуск агента |
-| `neuronium-agent status --trace-id ID` | Статус выполнения |
-| `neuronium-agent control --trace-id ID --command pause` | Управление |
+| Command | Description |
+|---------|-------------|
+| `neuronium-agent run --objective "..."` | Start agent (default runbook `super_agent_v0`; use `--runbook ID` to override) |
+| `neuronium-agent run --trace-id ID` | Resume run from checkpoint |
+| `neuronium-agent status --trace-id ID` | Check run status |
+| `neuronium-agent control --trace-id ID --command pause` | Control (continue / pause / revise / replan / stop / escalate) |
 | `neuronium-agent replay --trace-id ID` | Replay (experimental) |
 | `neuronium-agent worker` | Redis+RQ worker |
 
@@ -161,30 +167,26 @@ pytest tests/ -v
 
 ## Extras
 
-| Extra | Зависимости | Назначение |
-|-------|------------|------------|
+| Extra | Dependencies | Purpose |
+|-------|--------------|---------|
 | `[docker]` | docker | CodeNode sandbox |
 | `[postgres]` | psycopg | Production index store |
 | `[redis]` | redis, rq | Async queue runner |
-| `[pgvector]` | pgvector | Semantic search в Postgres |
-| `[embeddings]` | sentence-transformers | Локальные эмбеддинги |
-| `[dev]` | pytest | Тесты |
-| `[all]` | Всё вместе | Полная установка |
+| `[pgvector]` | pgvector | Semantic search in Postgres |
+| `[embeddings]` | sentence-transformers | Local embeddings |
+| `[dev]` | pytest | Tests |
+| `[all]` | All of the above | Full install |
 
 ---
 
-## Документация
+## Documentation
 
 - **Docs index**: `docs/README.md`
-- **Demo walkthrough (RU)**: `docs/demos/DEMO_WALKTHROUGH_RU.md`
-- **Conference demo script (RU)**: `docs/demos/CONFERENCE_DEMO_SCRIPT_RU.md`
-- **Management status report (RU)**: `docs/reports/STATUS_REPORT_FOR_MANAGEMENT_RU.md`
-- **Technical overview (RU)**: `docs/overview/PROJECT_TECH_OVERVIEW_RU.md`
-- **Implementation Binding**: `docs/architecture/Implementation_Binding_Spec.md`
-- **Roadmap**: `docs/roadmap/ROADMAP.md`
-- **Roadmap status**: `docs/roadmap/ROADMAP_STATUS.md`
 - **Config**: `docs/architecture/CONFIG_SPEC.md`
 - **Public API**: `docs/architecture/PUBLIC_API_SPEC.md`
 - **Storage schema**: `docs/architecture/STORAGE_SCHEMA_SPEC.md`
+- **Implementation Binding**: `docs/architecture/Implementation_Binding_Spec.md`
+- **Roadmap**: `docs/roadmap/ROADMAP.md`
+- **ADR (planner backend boundary)**: `docs/architecture/ADR_planner_backend_boundary.md`
 - **Presentation**: `docs/architecture/Super_Agent_presentation.md`
 - **Full architecture spec**: `docs/architecture/AI_Super_Agent_Architecture_Implementation_Specification.md`

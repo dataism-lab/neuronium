@@ -45,6 +45,12 @@ class IndexStore(ABC):
     @abstractmethod
     def get_artifact(self, artifact_id: str) -> dict[str, Any] | None: ...
 
+    @abstractmethod
+    def mark_artifacts_deprecated(
+        self, artifact_ids: list[str], reason: str = "rollback"
+    ) -> None:
+        """Mark artifacts as deprecated for lineage (B1 Part 2 §3.4.1)."""
+
     # -- lineage -------------------------------------------------------------
     @abstractmethod
     def record_lineage_edge(

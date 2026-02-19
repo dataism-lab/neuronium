@@ -13,7 +13,27 @@ from neuronium_agent.types import ControlCommand, RunRequest
 
 
 _REPLAY_MAP: dict[str, list[dict]] = {
+    "super_method_select_clarification_questions": [
+        {
+            "outputs": {
+                "content": json.dumps({
+                    "questions": [
+                        {
+                            "key": "url",
+                            "prompt": "Укажи URL новости или статьи.",
+                            "expected_type": "url",
+                            "required": True,
+                            "examples": [],
+                        },
+                    ],
+                }),
+            },
+            "quality_signals": {"tokens_used": 8},
+            "status": "COMPLETED",
+        },
+    ],
     "super_method_select_extract_envelope": [
+        # 1st call: before clarification — missing url so planner escalates
         {
             "outputs": {
                 "parsed": {
@@ -28,14 +48,25 @@ _REPLAY_MAP: dict[str, list[dict]] = {
             "quality_signals": {"tokens_used": 12},
             "status": "COMPLETED",
         },
+        # 2nd and later calls: after resume (user provided url) — no missing fields
         {
             "outputs": {
                 "parsed": {
                     "intent": {"task_type": "news_summary", "confidence": 0.9},
-                    "inputs": {},
-                    "missing_fields": [
-                        {"field": "url", "reason": "URL is required", "critical": True},
-                    ],
+                    "inputs": {"url": "https://example.com/news/1"},
+                    "missing_fields": [],
+                    "extras": {},
+                },
+            },
+            "quality_signals": {"tokens_used": 12},
+            "status": "COMPLETED",
+        },
+        {
+            "outputs": {
+                "parsed": {
+                    "intent": {"task_type": "news_summary", "confidence": 0.9},
+                    "inputs": {"url": "https://example.com/news/1"},
+                    "missing_fields": [],
                     "extras": {},
                 },
             },
@@ -89,8 +120,8 @@ def _make_runner(tmp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> AgentRunner:
     )
     original_build = runner._orchestrator._build_node_registry
 
-    def patched_build(graph):
-        registry = original_build(graph)
+    def patched_build(graph, *, stage_default_model_id=None, **kwargs):
+        registry = original_build(graph, stage_default_model_id=stage_default_model_id, **kwargs)
         for nid, node in registry.items():
             if hasattr(node, "set_replay_responses") and nid in _REPLAY_MAP:
                 node.set_replay_responses(_REPLAY_MAP[nid])

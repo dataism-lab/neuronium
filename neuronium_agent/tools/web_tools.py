@@ -161,8 +161,12 @@ def _resolve_effective_base_url(*, base_url: str, html: str, soup: Any | None = 
     return _normalize_base_url_for_relative(candidate)
 
 
+# Common file extensions: if last path segment ends with one, treat URL as file; else as directory.
+_RELATIVE_BASE_FILE_EXTENSIONS = (".html", ".htm", ".pdf", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".xml")
+
+
 def _normalize_base_url_for_relative(url: str) -> str:
-    """Treat extension-less terminal segment as directory-like URL."""
+    """Treat extension-less (or version-like) terminal segment as directory-like URL."""
     try:
         parts = urlsplit(url)
     except Exception:
@@ -171,8 +175,9 @@ def _normalize_base_url_for_relative(url: str) -> str:
     if path.endswith("/"):
         return url
     last_segment = path.rsplit("/", 1)[-1]
-    # Heuristic for pages like /html/2511.12869v2 where relative assets are siblings.
-    if "." not in last_segment:
+    # No dot → directory (e.g. /base). Dot but no known extension → directory (e.g. /html/2511.12869v2).
+    looks_like_file = "." in last_segment and last_segment.lower().endswith(_RELATIVE_BASE_FILE_EXTENSIONS)
+    if not looks_like_file:
         path = path + "/"
         return urlunsplit((parts.scheme, parts.netloc, path, parts.query, parts.fragment))
     return url
