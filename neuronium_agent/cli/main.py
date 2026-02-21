@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import queue
 import sys
 import threading
@@ -65,31 +66,8 @@ def _interactive_supervised_loop(
             questions = []
 
         click.echo("Run paused: требуется уточнение входных параметров.")
-        # Optional bulk JSON shortcut (fast paste), but default UX is per-question.
-        parsed: dict[str, object] = {}
-        if len(questions) >= 2:
-            click.echo("Можно вставить JSON-объект с ответами (Enter чтобы отвечать по одному).")
-            click.echo('Пример: {"url":"https://...","doc_paths":["a.md","b.md"]}')
-            raw = click.prompt("answers_json (optional)", default="", show_default=False).strip()
-            if raw:
-                try:
-                    obj = json.loads(raw)
-                    if isinstance(obj, dict):
-                        parsed = obj
-                except Exception:
-                    parsed = {}
 
         answers: dict[str, object] = {}
-        # 1) Apply any parsed bulk answers (only for known keys)
-        if parsed:
-            for q in questions:
-                if not isinstance(q, dict):
-                    continue
-                key = str(q.get("key", "")).strip()
-                if key and key in parsed:
-                    answers[key] = parsed[key]
-
-        # 2) Ask remaining questions one-by-one
         for q in questions:
             if not isinstance(q, dict):
                 continue
@@ -148,6 +126,52 @@ def _print_pause_help(runner: AgentRunner, trace_id: str) -> None:
     click.echo(f"  neuronium-agent run --mode supervised --trace-id {trace_id}")
 
 
+def _read_stdin_line_nonblocking(
+    stop_event: threading.Event,
+    poll_interval: float = 0.15,
+) -> str | None:
+    """Read one line from stdin without blocking indefinitely.
+
+    Uses platform-specific non-blocking I/O so the calling thread can exit
+    promptly when *stop_event* is set — eliminating the stdin race condition
+    between the background input-reader and ``click.prompt()`` in the
+    clarification flow (BUG-1).
+
+    Returns the stripped line, or ``None`` if *stop_event* fired / EOF.
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        buf: list[str] = []
+        while not stop_event.is_set():
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    return "".join(buf)
+                if ch == "\x08":  # backspace
+                    if buf:
+                        buf.pop()
+                    continue
+                if ch in ("\x00", "\xe0"):  # special-key prefix
+                    msvcrt.getwch()  # consume second byte
+                    continue
+                buf.append(ch)
+            else:
+                stop_event.wait(poll_interval)
+        return None
+    else:
+        import select as _select
+
+        while not stop_event.is_set():
+            ready, _, _ = _select.select([sys.stdin], [], [], poll_interval)
+            if ready:
+                line = sys.stdin.readline()
+                if not line:
+                    return None
+                return line.strip()
+        return None
+
+
 def _input_reader_loop(
     command_queue: queue.Queue[str | None],
     stop_event: threading.Event,
@@ -155,9 +179,10 @@ def _input_reader_loop(
     """Run in a daemon thread: read stdin, push 'pause' or 'stop' into queue."""
     while not stop_event.is_set():
         try:
-            line = input().strip().lower() if sys.stdin.isatty() else ""
-            if stop_event.is_set():
+            line = _read_stdin_line_nonblocking(stop_event)
+            if line is None or stop_event.is_set():
                 break
+            line = line.strip().lower()
             if line in ("q", "quit", "stop"):
                 command_queue.put("stop")
             elif line in ("p", "pause", ""):
@@ -314,6 +339,8 @@ def _interactive_run_loop(
             elif result_holder2.get("handle") and c == "pause":
                 runner.control(result_holder2["handle"], ControlCommand(type="pause", payload={}))  # type: ignore[arg-type]
         stop2.set()
+        if sys.stdin.isatty():
+            inp2.join(timeout=1.0)
         w2.join()
         if result_holder2.get("exc"):
             raise result_holder2["exc"]
