@@ -26,6 +26,38 @@ from neuronium_agent.types import ControlCommand, InterruptRequest, RunRequest
 
 
 # ---------------------------------------------------------------------------
+# Synchronisation helper — eliminates race between _run_runbook clearing
+# stale interrupts (pop) and the test injecting a new one.
+# ---------------------------------------------------------------------------
+
+class _SyncInterruptDict(dict):
+    """Blocks the worker on its first ``pop()`` until :meth:`arm` injects
+    the desired :class:`InterruptRequest` and releases the worker."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._pop_event = threading.Event()
+        self._continue_event = threading.Event()
+        self._first_pop_done = False
+
+    def pop(self, *args, **kwargs):  # type: ignore[override]
+        result = super().pop(*args, **kwargs)
+        if not self._first_pop_done:
+            self._first_pop_done = True
+            self._pop_event.set()
+            self._continue_event.wait(timeout=10.0)
+        return result
+
+    def arm(self, trace_id: str, request: InterruptRequest) -> None:
+        """Block until first ``pop()``, inject *request*, unblock worker."""
+        assert self._pop_event.wait(timeout=5.0), (
+            "_run_runbook should have called pop()"
+        )
+        self[trace_id] = request
+        self._continue_event.set()
+
+
+# ---------------------------------------------------------------------------
 # Replay data (autofix_demo iter1: generate → execute → critic)
 # ---------------------------------------------------------------------------
 
@@ -54,7 +86,7 @@ _REPLAY_MAP: dict[str, list[dict]] = {
 
 
 # ---------------------------------------------------------------------------
-# Fixtures
+# Fixtures / helpers
 # ---------------------------------------------------------------------------
 
 def _make_runner(
@@ -91,56 +123,81 @@ def _make_runner(
     return runner
 
 
+def _start_and_interrupt(
+    runner: AgentRunner,
+    objective: str,
+    request: InterruptRequest,
+):
+    """Start a run and deterministically inject *request* mid-execution.
+
+    Uses :class:`_SyncInterruptDict` to guarantee the interrupt is set
+    after ``_run_runbook`` clears stale data but before the executor's
+    ``interrupt_check`` runs.
+    """
+    sync = _SyncInterruptDict()
+    runner._orchestrator._interrupt_requests = sync  # type: ignore[assignment]
+
+    handle_holder: list = []
+
+    def worker() -> None:
+        handle = runner.start(
+            RunRequest(objective=objective),
+            on_handle_ready=lambda h: handle_holder.append(h),
+        )
+        handle_holder.append(("done", handle))
+
+    t = threading.Thread(target=worker)
+    t.start()
+
+    for _ in range(500):
+        if handle_holder:
+            break
+        time.sleep(0.01)
+    assert handle_holder, "on_handle_ready was not called"
+    handle = handle_holder[0]
+
+    sync.arm(handle.trace_id, request)
+
+    t.join(timeout=30.0)
+    assert not t.is_alive(), "Worker thread should have finished"
+    return handle
+
+
 # ---------------------------------------------------------------------------
-# 7.1 — Mid-execution pause: start → pause after first node → PAUSED + checkpoint
+# 7.1 — Mid-execution pause
 # ---------------------------------------------------------------------------
 
 def test_start_then_pause_mid_execution_leaves_run_paused_with_checkpoint(
     tmp_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """7.1: Set interrupt from main thread as soon as we have handle; executor sees it after first batch."""
+    """7.1: Deterministic interrupt after first batch → PAUSED + checkpoint."""
     runner = _make_runner(tmp_dir, monkeypatch)
-    handle_holder: list = []
+    handle = _start_and_interrupt(
+        runner, "Full control 7.1",
+        InterruptRequest(command="pause", mode="graceful"),
+    )
 
-    def run_start() -> None:
-        handle = runner.start(
-            RunRequest(objective="Full control 7.1"),
-            on_handle_ready=lambda h: handle_holder.append(h),
-        )
-        handle_holder.append(("done", handle))
+    assert runner.get_status(handle).state == "PAUSED"
 
-    thread = threading.Thread(target=run_start)
-    thread.start()
-    # Set interrupt as soon as we have handle (_run_runbook clears it at start, so we set after that)
-    for _ in range(500):
-        if handle_holder:
-            break
-        time.sleep(0.01)
-    assert handle_holder, "on_handle_ready should have been called"
-    handle = handle_holder[0]
-    runner._orchestrator._interrupt_requests[handle.trace_id] = InterruptRequest(command="pause", mode="graceful")
-
-    thread.join(timeout=30.0)
-    assert not thread.is_alive(), "Worker thread should have finished"
-
-    assert hasattr(handle, "trace_id")
-    status = runner.get_status(handle)
-    assert status.state == "PAUSED", f"Expected PAUSED, got {status.state}"
-
-    # Mid-execute pause writes paused_mid_execute then _record_control_decision adds "paused"; either is valid
     events = list(runner._index.get_trace_events(handle.trace_id))
     cp_events = [e for e in events if e.get("kind") == "checkpoint"]
-    boundaries = [e.get("payload", {}).get("resume_context", {}).get("phase_boundary") for e in cp_events]
+    boundaries = [
+        e.get("payload", {}).get("resume_context", {}).get("phase_boundary")
+        for e in cp_events
+    ]
     assert "paused_mid_execute" in boundaries, (
-        f"Trace should contain paused_mid_execute checkpoint for resume; got {boundaries}"
+        f"Trace should contain paused_mid_execute checkpoint; got {boundaries}"
     )
-    latest = get_latest_phase_boundary_checkpoint(runner._index, handle.trace_id)
-    assert latest is not None
-    rc = latest.get("resume_context", {})
-    # resumed context for exact pause point comes from paused_mid_execute (may not be latest due to "paused" record)
     mid_cp = next(
-        (e["payload"] for e in cp_events if e.get("payload", {}).get("resume_context", {}).get("phase_boundary") == "paused_mid_execute"),
+        (
+            e["payload"]
+            for e in cp_events
+            if e.get("payload", {})
+            .get("resume_context", {})
+            .get("phase_boundary")
+            == "paused_mid_execute"
+        ),
         None,
     )
     assert mid_cp is not None
@@ -156,29 +213,12 @@ def test_paused_continue_resume_run_completes(
     tmp_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """7.2: Full cycle start → set interrupt from main thread → continue → resume_run → COMPLETED."""
+    """7.2: Full cycle — pause → continue → resume_run → COMPLETED."""
     runner = _make_runner(tmp_dir, monkeypatch)
-    handle_holder: list = []
-
-    def run_start() -> None:
-        handle = runner.start(
-            RunRequest(objective="Full control 7.2"),
-            on_handle_ready=lambda h: handle_holder.append(h),
-        )
-        handle_holder.append(("done", handle))
-
-    thread = threading.Thread(target=run_start)
-    thread.start()
-    for _ in range(500):
-        if handle_holder:
-            break
-        time.sleep(0.01)
-    assert handle_holder
-    handle = handle_holder[0]
-    runner._orchestrator._interrupt_requests[handle.trace_id] = InterruptRequest(command="pause", mode="graceful")
-
-    thread.join(timeout=30.0)
-    assert not thread.is_alive()
+    handle = _start_and_interrupt(
+        runner, "Full control 7.2",
+        InterruptRequest(command="pause", mode="graceful"),
+    )
 
     assert runner.get_status(handle).state == "PAUSED"
 
@@ -191,48 +231,21 @@ def test_paused_continue_resume_run_completes(
 
 
 # ---------------------------------------------------------------------------
-# 7.3 — Stop graceful vs stop immediate (checkpoint difference)
+# 7.3 — Stop graceful vs stop immediate
 # ---------------------------------------------------------------------------
-
-def _run_until_stop(
-    runner: AgentRunner,
-    handle_holder: list,
-    stop_payload: dict,
-) -> None:
-    def run_start() -> None:
-        handle = runner.start(
-            RunRequest(objective="Stop test"),
-            on_handle_ready=lambda h: handle_holder.append(h),
-        )
-        handle_holder.append(("done", handle))
-
-    thread = threading.Thread(target=run_start)
-    thread.start()
-    for _ in range(500):
-        if handle_holder:
-            break
-        time.sleep(0.01)
-    assert handle_holder
-    handle = handle_holder[0]
-    runner._orchestrator._interrupt_requests[handle.trace_id] = InterruptRequest(
-        command="stop",
-        mode=stop_payload.get("mode", "graceful"),
-        export_path=stop_payload.get("export_path"),
-    )
-    thread.join(timeout=30.0)
-    assert not thread.is_alive()
-    assert runner.get_status(handle).state == "CANCELLED"
-
 
 def test_stop_graceful_writes_full_mid_execute_checkpoint(
     tmp_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """7.3 (graceful): Stop with mode=graceful leaves checkpoint with phase_boundary paused_mid_execute and full context."""
+    """7.3 (graceful): checkpoint with paused_mid_execute and full context."""
     runner = _make_runner(tmp_dir, monkeypatch)
-    handle_holder: list = []
-    _run_until_stop(runner, handle_holder, {"mode": "graceful"})
-    handle = handle_holder[0]
+    handle = _start_and_interrupt(
+        runner, "Stop test graceful",
+        InterruptRequest(command="stop", mode="graceful"),
+    )
+
+    assert runner.get_status(handle).state == "CANCELLED"
 
     cp = get_latest_phase_boundary_checkpoint(runner._index, handle.trace_id)
     assert cp is not None
@@ -247,16 +260,18 @@ def test_stop_immediate_writes_minimal_checkpoint(
     tmp_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """7.3 (immediate): Stop with mode=immediate leaves checkpoint cancelled_mid_execute without full resume context."""
+    """7.3 (immediate): checkpoint cancelled_mid_execute without full resume context."""
     runner = _make_runner(tmp_dir, monkeypatch)
-    handle_holder: list = []
-    _run_until_stop(runner, handle_holder, {"mode": "immediate"})
-    handle = handle_holder[0]
+    handle = _start_and_interrupt(
+        runner, "Stop test immediate",
+        InterruptRequest(command="stop", mode="immediate"),
+    )
+
+    assert runner.get_status(handle).state == "CANCELLED"
 
     cp = get_latest_phase_boundary_checkpoint(runner._index, handle.trace_id)
     assert cp is not None
     rc = cp.get("resume_context", {})
     assert rc.get("phase_boundary") == "cancelled_mid_execute"
-    # Minimal checkpoint: no completed_node_results / pending_node_ids for resume
     assert rc.get("completed_node_results") is None or rc.get("completed_node_results") == {}
     assert rc.get("pending_node_ids") is None or rc.get("pending_node_ids") == []
