@@ -1539,6 +1539,13 @@ class Orchestrator:
                         out_text = answers.get("output_text")
                         if isinstance(out_text, str) and out_text.strip():
                             metadata["output_text"] = out_text.strip()
+                        for ans_key, ans_val in answers.items():
+                            if ans_key in metadata:
+                                continue
+                            if isinstance(ans_val, str) and ans_val.strip():
+                                metadata[ans_key] = ans_val.strip()
+                            elif isinstance(ans_val, list) and ans_val:
+                                metadata[ans_key] = ans_val
             # Pick up doc_paths for docs_report_v1
             if (
                 payload.get("runbook_id") == runbook_id

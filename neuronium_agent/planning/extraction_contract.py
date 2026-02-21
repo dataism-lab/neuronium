@@ -120,7 +120,14 @@ def extraction_envelope_json_schema() -> dict[str, Any]:
                     "additionalProperties": False,
                     "required": ["field", "reason", "critical"],
                     "properties": {
-                        "field": {"type": "string"},
+                    "field": {
+                            "type": "string",
+                            "enum": [
+                                "url", "urls", "doc_paths", "language",
+                                "output_format", "summary_length",
+                                "output_filename", "output_text",
+                            ],
+                        },
                         "reason": {"type": "string"},
                         "critical": {"type": "boolean"},
                     },
