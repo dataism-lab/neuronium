@@ -204,3 +204,40 @@
 ### Handoff note
 - Keep current dynamic required-field merge strategy (union across allowed tools) for phase 2; review strictness before wider rollout.
 - Phase 3 should only address patch/revise integration and should not rework phase-2 compatibility bridge unless regression evidence appears.
+
+## 2026-02-24 — Phase 3 preflight: ToolSchemaRegistry placement
+
+### Plan
+- Lock phase-3 precondition: move `ToolSchemaRegistry` to shared layer before/at start of revise-patch integration.
+- Keep migration low-risk with a backward-compatible shim in planning namespace.
+- Validate preflight baseline tests for import boundaries, legacy revise regression, and deterministic patch path.
+
+### Decisions
+- Added shared module:
+  - `neuronium_agent/schemas/tool_schema_registry.py` (canonical location for registry + pointer helpers).
+- Kept backward compatibility:
+  - `neuronium_agent/planning/tool_schema_registry.py` converted to shim exporting the shared implementation.
+- Updated internal consumers to shared import:
+  - `neuronium_agent/planning/missing_slots.py`
+  - `neuronium_agent/planning/htn_recursive_backend.py`
+- Updated tests to validate shared import boundary while preserving planning shim compatibility:
+  - `tests/test_tool_schema_registry.py`
+- Updated migration doc with explicit phase-3 preflight placement lock and compatibility bridge policy:
+  - `docs/internal/TOOL_AGNOSTIC_MIGRATION_PLAN.md`
+
+### Verification
+- Ran preflight baseline:
+  - `uv run pytest tests/test_tool_schema_registry.py tests/test_missing_slots.py tests/test_state_patch.py tests/test_supervised_clarification_flow.py tests/test_phase2_dynamic_extraction_schema.py tests/test_planner_backend_contract.py -q`
+- Result:
+  - `27 passed in 0.54s`
+- Lint check:
+  - no linter errors in edited files.
+
+### Outcome
+- Tool schema contract logic is now shared-ready for phase-3 second consumer (`orchestrator/revise`) without cross-module planning coupling.
+- Backward compatibility preserved through planning shim.
+- Preflight acceptance baseline is green and documented.
+
+### Handoff note
+- Phase 3 implementation should consume `ToolSchemaRegistry` from `neuronium_agent.schemas.tool_schema_registry`.
+- Keep legacy `answers` support via bridge during phase 3; remove legacy path only after dedicated compatibility acceptance.
