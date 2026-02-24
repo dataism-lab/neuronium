@@ -29,6 +29,30 @@ if TYPE_CHECKING:
     from neuronium_agent.api import AgentRunner
 
 
+def _question_group_from_path(path: object) -> str:
+    pointer = str(path or "").strip()
+    if not pointer.startswith("/"):
+        return "root"
+    tokens = [token for token in pointer.split("/") if token]
+    if not tokens:
+        return "root"
+    if tokens[0] in {"inputs", "tool_args"}:
+        return tokens[0]
+    return "root"
+
+
+def _question_prompt_with_examples(question: dict[str, Any]) -> str:
+    key = str(question.get("key", "")).strip()
+    base = str(question.get("prompt", key)).strip() or key
+    examples = question.get("examples")
+    if not isinstance(examples, list):
+        return base
+    normalized_examples = [str(item).strip() for item in examples if str(item).strip()]
+    if not normalized_examples:
+        return base
+    return f"{base} Пример: {normalized_examples[0]}"
+
+
 def _setup_logging(level: str = "INFO", json_logs: bool = True) -> None:
     fmt = (
         '{"ts":"%(asctime)s","level":"%(levelname)s","name":"%(name)s","msg":"%(message)s"}'
@@ -80,13 +104,19 @@ def _interactive_supervised_loop(
             }
         else:
             answers: dict[str, object] = {}
+            printed_groups: set[str] = set()
             for q in questions:
                 if not isinstance(q, dict):
                     continue
                 key = str(q.get("key", "")).strip()
                 if not key or key in answers:
                     continue
-                prompt = str(q.get("prompt", key)).strip() or key
+                group = _question_group_from_path(q.get("path"))
+                if group not in printed_groups:
+                    printed_groups.add(group)
+                    click.echo("")
+                    click.echo(f"[{group}]")
+                prompt = _question_prompt_with_examples(q)
                 answer = click.prompt(prompt, default="", show_default=False).strip()
                 if key in {"doc_paths", "paths"}:
                     answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
@@ -124,14 +154,20 @@ def _print_pause_help(runner: AgentRunner, trace_id: str) -> None:
         return
     click.echo("")
     click.echo("PAUSED: требуется уточнение параметров.")
-    click.echo("Вопросы:")
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for q in questions:
         if not isinstance(q, dict):
             continue
-        key = str(q.get("key", "")).strip()
-        prompt = str(q.get("prompt", "")).strip()
-        if key and prompt:
-            click.echo(f"- {key}: {prompt}")
+        grouped.setdefault(_question_group_from_path(q.get("path")), []).append(q)
+
+    click.echo("Вопросы:")
+    for group in sorted(grouped):
+        click.echo(f"- Группа: {group}")
+        for q in grouped[group]:
+            key = str(q.get("key", "")).strip()
+            prompt = _question_prompt_with_examples(q)
+            if key and prompt:
+                click.echo(f"  - {key}: {prompt}")
     click.echo("")
     click.echo("Чтобы ответить интерактивно, запусти:")
     click.echo(f"  neuronium-agent run --mode supervised --trace-id {trace_id}")

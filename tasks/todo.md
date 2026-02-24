@@ -435,3 +435,56 @@
 
 ### Handoff note
 - Next optional step: move NL->patch conversion out of `apply_control` into a dedicated control service if strict “purely declarative control” boundary is required by architecture governance.
+
+## 2026-02-24 — Phase 6 implementation: clarification UX grouping + human prompts
+
+### Plan
+- Implement phase 6 incrementally without broad rewrites:
+  - improve question UX in planner clarification generation,
+  - improve grouped presentation in CLI pause flow,
+  - keep backward compatibility of clarification contracts.
+- Update phase-6 section in migration doc with explicit implementation/acceptance checklist.
+- Prove behavior with targeted UX tests + clarification regressions.
+
+### Decisions
+- `neuronium_agent/planning/htn_recursive_backend.py`:
+  - added deterministic UX helpers for clarification questions:
+    - `_question_group_from_path(...)`,
+    - `_sort_questions_for_presentation(...)`,
+    - `_human_prompt_for_question(...)`,
+    - `_examples_for_schema(...)`,
+    - `_question_group_snapshot(...)`.
+  - fallback question generation now creates human-friendly prompts and examples from `expected_schema`.
+  - model-generated questions are normalized when fields are missing (`prompt/examples/path`), then deterministically sorted by `(group, key)`.
+  - clarification request context now includes `question_groups` snapshot for presentation/audit.
+- `neuronium_agent/cli/main.py`:
+  - added presentation helpers:
+    - `_question_group_from_path(...)`,
+    - `_question_prompt_with_examples(...)`.
+  - supervised interactive clarify flow now prints group headers and includes one short example in prompt.
+  - pause help output now prints grouped questions (`inputs`, `tool_args`, `root`) instead of flat list.
+- `docs/internal/TOOL_AGNOSTIC_MIGRATION_PLAN.md`:
+  - phase 6 expanded with step-by-step implementation plan, explicit done criteria, and acceptance test set.
+- Added new tests:
+  - `tests/test_phase6_clarification_ux.py`.
+
+### Verification
+- Ran:
+  - `uv run pytest tests/test_phase6_clarification_ux.py tests/test_supervised_clarification_flow.py tests/test_cli_bug5_pause_flow.py -q`
+  - Result: `14 passed in 0.89s`
+- Lint check:
+  - `neuronium_agent/planning/htn_recursive_backend.py`
+  - `neuronium_agent/cli/main.py`
+  - `tests/test_phase6_clarification_ux.py`
+  - Result: no linter errors.
+
+### Outcome
+- Phase 6 UX baseline is implemented:
+  - clarification questions are human-friendly and include examples,
+  - question ordering/grouping is deterministic and path-aware,
+  - CLI pause presentation is grouped and easier to answer.
+- Backward compatibility is preserved (`missing_fields`, revise flow, existing tests green).
+
+### Handoff note
+- Next iteration can optionally move grouping metadata from `context.question_groups` into a dedicated top-level clarification artifact field if external UI consumers need a stricter contract.
+- Before deprecating any legacy formatting, run compatibility checks for existing clients parsing flat question lists.
