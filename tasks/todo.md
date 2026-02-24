@@ -532,3 +532,85 @@
 
 ### Handoff note
 - If schema-driven parser needs richer coercion (dates/objects), extend via explicit schema facets and keep strict unit coverage for ambiguous inputs.
+
+## 2026-02-24 — Migration plan sync after phase 6 closure
+
+### Plan
+- Synchronize migration plan status with delivered phase 6 PR.
+- Capture clear next step after phase 6.
+
+### Decisions
+- Updated `docs/internal/TOOL_AGNOSTIC_MIGRATION_PLAN.md`:
+  - marked `Phase 6` as completed with PR #9 evidence;
+  - added explicit "next recommended focus" for bug track.
+- Selected next focus: `BUG-4` as separate critic/evidence workstream (per matrix/gates in section 7).
+
+### Verification
+- Verified the phase status block now includes phase 6 completion and next-focus note.
+
+### Outcome
+- Migration plan reflects actual implementation state and immediate next priority.
+
+### Handoff note
+- Start BUG-4 with a narrow plan first: define missing critic context contract and add failing tests before implementation.
+
+## 2026-02-24 — BUG-4 closure: critic context/evidence visibility
+
+### Plan
+- Зафиксировать контракт обязательного clarification/evidence контекста для critic.
+- Добавить red-тесты на пропажу/перетирание контекста в unit/integration/replay контурах.
+- Точечно исправить передачу контекста без широкого рефакторинга.
+- Подтвердить replay-детерминизм и прогнать таргетные + регрессионные тесты.
+
+### Decisions
+- `docs/internal/bug-tracking/CLARIFICATION_FLOW_BUGS.md`:
+  - для BUG-4 добавлен явный контракт `clarification_context_envelope` и Definition of Done.
+- `neuronium_agent/core/orchestrator.py`:
+  - добавлен `_build_clarification_context_inputs(...)`, который собирает contract fields:
+    - `clarification_request_artifact_id`,
+    - `clarification_response_artifact_id`,
+    - `clarification_evidence_artifact_ids`,
+    - `clarification_context_envelope` (request/response payload + version).
+  - эти поля теперь подмешиваются в `execute_inputs` на этапе `_run_runbook`.
+  - в `_infer_runbook_metadata(...)` добавлено восстановление `clarification_evidence_artifact_ids`
+    из события `Escalation requested`.
+- `neuronium_agent/execution/executor.py`:
+  - в `_gather_inputs(...)` введено сохранение приоритета orchestrator contract keys над
+    upstream collisions (`_PRESERVE_INITIAL_CONTEXT_KEYS`), чтобы исключить тихую потерю контекста.
+- Тесты:
+  - `tests/test_executor_prompt_context.py`:
+    - добавлен red→green кейс на коллизию upstream vs initial для clarification contract keys.
+  - `tests/test_supervised_clarification_flow.py`:
+    - добавлен integration-кейс, проверяющий наличие clarification envelope в prompt критика после
+      `pause -> revise -> continue -> resume`;
+    - добавлен replay parity кейс на идентичность prompt critic в live/replay.
+- `docs/internal/TOOL_AGNOSTIC_MIGRATION_PLAN.md`:
+  - обновлён статус BUG-4 как закрытого отдельным workstream.
+
+### Verification
+- Red-тесты до фикса:
+  - `uv run pytest -q tests/test_executor_prompt_context.py tests/test_supervised_clarification_flow.py`
+  - Результат: `2 failed, 10 passed` (ожидаемо, BUG-4 воспроизведён).
+- После фикса (таргет):
+  - `uv run pytest -q tests/test_executor_prompt_context.py tests/test_supervised_clarification_flow.py`
+  - Результат: `12 passed`.
+- Регрессия:
+  - `uv run pytest -q tests/test_planner_replay_strict.py tests/test_replay.py tests/test_determinism.py tests/test_phase6_clarification_ux.py tests/test_cli_bug5_pause_flow.py`
+  - Результат: `26 passed`.
+- Lint check:
+  - `neuronium_agent/core/orchestrator.py`
+  - `neuronium_agent/execution/executor.py`
+  - `tests/test_executor_prompt_context.py`
+  - `tests/test_supervised_clarification_flow.py`
+  - `docs/internal/bug-tracking/CLARIFICATION_FLOW_BUGS.md`
+  - Результат: no linter errors.
+
+### Outcome
+- BUG-4 закрыт на контрактном уровне:
+  - critic гарантированно получает clarification/evidence context через стабильный envelope;
+  - исчезает риск тихого перетирания contract keys в merge inputs;
+  - replay подтверждён на уровне эквивалентности critic prompt для BUG-4 контекста.
+
+### Handoff note
+- Следующий шаг по hardening: добавить 1-2 edge-case теста на пустой/частично битый artifact payload
+  (request/response), чтобы явно зафиксировать degrade-safe поведение envelope builder без падения runbook.

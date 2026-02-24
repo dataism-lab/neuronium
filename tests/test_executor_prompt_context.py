@@ -74,3 +74,55 @@ def test_critic_prompt_includes_source_context_for_web_like_inputs() -> None:
     assert "Arxiv title" in prompt
     assert "final_url" in prompt
 
+
+def test_critic_prompt_prefers_initial_clarification_contract_over_upstream_collision() -> None:
+    graph = ActionGraph(
+        metadata=GraphMetadata(plan_id="p3", description="critic clarification contract"),
+        nodes=[
+            GraphNode(node_id="src", node_type="aggregate", label="src", priority=0),
+            GraphNode(
+                node_id="critic",
+                node_type="model",
+                label="critic",
+                priority=1,
+                parameters={"json_schema": {"type": "object"}},
+            ),
+        ],
+        edges=[GraphEdge(source="src", target="critic", edge_type="data")],
+    )
+    registry = {
+        "src": StaticOutputsNode(
+            "src",
+            outputs={
+                "clarification_request_artifact_id": "req-from-upstream",
+                "clarification_evidence_artifact_ids": ["ev-upstream"],
+            },
+        ),
+        "critic": EchoPromptNode("critic"),
+    }
+    ex = DAGExecutor(registry, execution_id="e3", trace_id="t3", random_seed=0)
+
+    results = ex.execute(
+        graph,
+        initial_inputs={
+            "objective": "Validate final answer",
+            "clarification_request_artifact_id": "req-from-initial",
+            "clarification_evidence_artifact_ids": ["ev-initial-1", "ev-initial-2"],
+            "clarification_context_envelope": {
+                "version": "v1",
+                "request_artifact_id": "req-from-initial",
+                "response_artifact_id": "resp-1",
+                "evidence_artifact_ids": ["ev-initial-1", "ev-initial-2"],
+            },
+        },
+    )
+    prompt = results["critic"].outputs["prompt"]
+    assert "clarification_request_artifact_id" in prompt
+    assert "req-from-initial" in prompt
+    assert "req-from-upstream" not in prompt
+    assert "clarification_evidence_artifact_ids" in prompt
+    assert "ev-initial-1" in prompt
+    assert "ev-upstream" not in prompt
+    assert "clarification_context_envelope" in prompt
+    assert "response_artifact_id" in prompt
+

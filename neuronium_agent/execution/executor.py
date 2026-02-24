@@ -24,6 +24,12 @@ from neuronium_agent.types import InterruptRequest
 logger = logging.getLogger(__name__)
 
 _MAX_RETRY_DELAY_SECONDS = 60.0
+_PRESERVE_INITIAL_CONTEXT_KEYS: set[str] = {
+    "clarification_request_artifact_id",
+    "clarification_response_artifact_id",
+    "clarification_evidence_artifact_ids",
+    "clarification_context_envelope",
+}
 
 
 class DAGExecutor:
@@ -391,6 +397,11 @@ class DAGExecutor:
                 inputs.update(pred_output.outputs)
         for k, v in initial_inputs.items():
             inputs.setdefault(k, v)
+        # Preserve orchestrator-provided clarification context contract.
+        # These keys must not be silently shadowed by upstream outputs.
+        for key in _PRESERVE_INITIAL_CONTEXT_KEYS:
+            if key in initial_inputs:
+                inputs[key] = initial_inputs[key]
 
         if graph_node and graph_node.node_type == "model" and "prompt" not in inputs:
             if graph_node.parameters.get("json_schema"):
