@@ -124,7 +124,13 @@ _REPLAY_MAP: dict[str, list[dict]] = {
 }
 
 
-def _make_runner(tmp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> AgentRunner:
+def _make_runner(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    replay_overrides: dict[str, list[dict]] | None = None,
+    nl_patch_min_confidence: float | None = None,
+) -> AgentRunner:
     monkeypatch.setenv("NEURONIUM_OPENAI_API_KEY", "test-fake-key")
     config = AppConfig(
         project=ProjectConfig(name="test", data_dir=str(tmp_dir / ".n")),
@@ -133,18 +139,23 @@ def _make_runner(tmp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> AgentRunner:
             sqlite_path=str(tmp_dir / "index.sqlite3"),
         ),
     )
+    if nl_patch_min_confidence is not None:
+        config.runtime.nl_patch_min_confidence = nl_patch_min_confidence
     runner = AgentRunner(
         config,
         FsCasStore(config.storage.fs_cas_root),
         SqliteIndexStore(config.storage.sqlite_path),
     )
     original_build = runner._orchestrator._build_node_registry
+    replay_map = dict(_REPLAY_MAP)
+    if replay_overrides:
+        replay_map.update(replay_overrides)
 
     def patched_build(graph, *, stage_default_model_id=None, **kwargs):
         registry = original_build(graph, stage_default_model_id=stage_default_model_id, **kwargs)
         for nid, node in registry.items():
-            if hasattr(node, "set_replay_responses") and nid in _REPLAY_MAP:
-                node.set_replay_responses(_REPLAY_MAP[nid])
+            if hasattr(node, "set_replay_responses") and nid in replay_map:
+                node.set_replay_responses(replay_map[nid])
         return registry
 
     runner._orchestrator._build_node_registry = patched_build  # type: ignore[method-assign]
@@ -371,3 +382,157 @@ def test_supervised_clarification_revise_answer_text_to_patch(
     assert isinstance(clarification_response.get("patch"), list)
     assert clarification_response["patch"]
     assert isinstance(clarification_response.get("nl_patch_conversion"), dict)
+
+
+def test_supervised_clarification_revise_answer_text_invalid_json_keeps_patch_empty(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(
+        tmp_dir,
+        monkeypatch,
+        replay_overrides={
+            "control_nl_to_patch": [{
+                "outputs": {"content": "not-json"},
+                "quality_signals": {"tokens_used": 3},
+                "status": "COMPLETED",
+            }],
+        },
+    )
+    handle = runner.start(RunRequest(
+        objective="Сделай сводку новости",
+        mode="supervised",
+        metadata={"runbook_id": "super_agent_v0"},
+    ))
+    pause_context = runner.get_latest_pause_context(handle.trace_id)
+    assert pause_context is not None
+    request_artifact_id = str(
+        pause_context.get("clarification_request_artifact_id", "")
+    ).strip()
+    assert request_artifact_id
+
+    runner.control(
+        handle,
+        ControlCommand(
+            type="revise",
+            payload={
+                "clarification_request_artifact_id": request_artifact_id,
+                "answer_text": "Ссылка та же, как выше.",
+            },
+        ),
+    )
+    events = list(runner._index.get_trace_events(handle.trace_id))
+    revise_events = [
+        e for e in events
+        if e["kind"] == "decision"
+        and e.get("payload", {}).get("description") == "control_command: revise"
+    ]
+    assert revise_events
+    control_payload = revise_events[-1]["payload"]["payload"]
+    assert control_payload.get("patch") == []
+    conversion = control_payload.get("nl_patch_conversion")
+    assert isinstance(conversion, dict)
+    assert conversion.get("status") == "invalid_json"
+
+
+def test_supervised_clarification_revise_answer_text_low_confidence_gates_patch(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(
+        tmp_dir,
+        monkeypatch,
+        replay_overrides={
+            "control_nl_to_patch": [{
+                "outputs": {
+                    "content": json.dumps({
+                        "patch": [{"op": "add", "path": "/url", "value": "https://example.com/news/1"}],
+                        "needs_clarification": False,
+                        "confidence": 0.2,
+                        "rationale": "Low confidence extraction.",
+                    }),
+                },
+                "quality_signals": {"tokens_used": 3},
+                "status": "COMPLETED",
+            }],
+        },
+    )
+    handle = runner.start(RunRequest(
+        objective="Сделай сводку новости",
+        mode="supervised",
+        metadata={"runbook_id": "super_agent_v0"},
+    ))
+    pause_context = runner.get_latest_pause_context(handle.trace_id)
+    assert pause_context is not None
+    request_artifact_id = str(
+        pause_context.get("clarification_request_artifact_id", "")
+    ).strip()
+    assert request_artifact_id
+
+    runner.control(
+        handle,
+        ControlCommand(
+            type="revise",
+            payload={
+                "clarification_request_artifact_id": request_artifact_id,
+                "answer_text": "Кажется это example.com",
+            },
+        ),
+    )
+    events = list(runner._index.get_trace_events(handle.trace_id))
+    revise_events = [
+        e for e in events
+        if e["kind"] == "decision"
+        and e.get("payload", {}).get("description") == "control_command: revise"
+    ]
+    assert revise_events
+    control_payload = revise_events[-1]["payload"]["payload"]
+    assert control_payload.get("patch") == []
+    conversion = control_payload.get("nl_patch_conversion")
+    assert isinstance(conversion, dict)
+    assert conversion.get("status") == "needs_clarification"
+
+
+def test_supervised_clarification_revise_answer_text_respects_configurable_threshold(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(
+        tmp_dir,
+        monkeypatch,
+        nl_patch_min_confidence=0.95,
+    )
+    handle = runner.start(RunRequest(
+        objective="Сделай сводку новости",
+        mode="supervised",
+        metadata={"runbook_id": "super_agent_v0"},
+    ))
+    pause_context = runner.get_latest_pause_context(handle.trace_id)
+    assert pause_context is not None
+    request_artifact_id = str(
+        pause_context.get("clarification_request_artifact_id", "")
+    ).strip()
+    assert request_artifact_id
+
+    runner.control(
+        handle,
+        ControlCommand(
+            type="revise",
+            payload={
+                "clarification_request_artifact_id": request_artifact_id,
+                "answer_text": "Возьми URL: https://example.com/news/1",
+            },
+        ),
+    )
+    events = list(runner._index.get_trace_events(handle.trace_id))
+    revise_events = [
+        e for e in events
+        if e["kind"] == "decision"
+        and e.get("payload", {}).get("description") == "control_command: revise"
+    ]
+    assert revise_events
+    control_payload = revise_events[-1]["payload"]["payload"]
+    assert control_payload.get("patch") == []
+    conversion = control_payload.get("nl_patch_conversion")
+    assert isinstance(conversion, dict)
+    assert conversion.get("status") == "needs_clarification"

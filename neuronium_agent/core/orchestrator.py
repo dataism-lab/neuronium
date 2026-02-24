@@ -340,7 +340,7 @@ class Orchestrator:
         return self._recorders.get(trace_id)
 
     # ------------------------------------------------------------------
-    # Declarative meta-control (no DAG execution)
+    # Declarative meta-control (no user plan DAG execution)
     # ------------------------------------------------------------------
 
     def apply_control(
@@ -351,7 +351,9 @@ class Orchestrator:
         """Apply a control command **declaratively**.
 
         Performs: state transition → checkpoint → trace decision.
-        Never executes DAG nodes or triggers orchestration.
+        Does not execute user plan DAGs or trigger stage orchestration.
+        Note: revise may perform a bounded internal model conversion step
+        (`answer_text -> patch`) when no structured patch/answers are provided.
         """
         state = self._states.get(trace_id)
         recorder = self._recorders.get(trace_id)
@@ -1646,7 +1648,7 @@ class Orchestrator:
             confidence_raw = parsed.get("confidence", 0.0)
             confidence = float(confidence_raw) if isinstance(confidence_raw, (int, float)) else 0.0
             rationale = str(parsed.get("rationale", "")).strip()
-            if needs_clarification or confidence < 0.5:
+            if needs_clarification or confidence < self.config.runtime.nl_patch_min_confidence:
                 return [], {
                     "status": "needs_clarification",
                     "confidence": confidence,

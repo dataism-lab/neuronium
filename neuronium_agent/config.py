@@ -52,6 +52,8 @@ class RuntimeConfig(BaseModel):
     """Grace period for pause: allow active nodes to reach checkpoint (Spec §9.1.2)."""
     stop_grace_period_seconds: int = 5
     """Grace period for cooperative stop before forced termination (Spec §6.2.4)."""
+    nl_patch_min_confidence: float = 0.5
+    """Minimum confidence for applying NL->patch conversion in revise flow."""
 
 
 class StorageConfig(BaseModel):
@@ -240,6 +242,7 @@ _FLAT_ENV_MAP: dict[str, tuple[str, ...]] = {
     "NEURONIUM_RUNTIME_MODE": ("runtime", "mode"),
     "NEURONIUM_RUNTIME_PAUSE_GRACE_PERIOD_SECONDS": ("runtime", "pause_grace_period_seconds"),
     "NEURONIUM_RUNTIME_STOP_GRACE_PERIOD_SECONDS": ("runtime", "stop_grace_period_seconds"),
+    "NEURONIUM_RUNTIME_NL_PATCH_MIN_CONFIDENCE": ("runtime", "nl_patch_min_confidence"),
     "NEURONIUM_LLM_PROVIDER": ("llm", "provider"),
     "NEURONIUM_LLM_MODEL": ("llm", "model"),
     "NEURONIUM_LLM_BASE_URL": ("llm", "base_url"),

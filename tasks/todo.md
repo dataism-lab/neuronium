@@ -397,3 +397,41 @@
 ### Handoff note
 - Next hardening step: add explicit negative-path tests for low-confidence/needs-clarification conversion outcomes across more runbooks.
 - Before removing legacy `answers` bridge, run compatibility window and migration metrics for clients still sending `answers`.
+
+## 2026-02-24 — Phase 5 hardening follow-up (PR quality)
+
+### Plan
+- Close post-review gaps in Phase 5 implementation without broad refactor.
+- Add confidence-threshold configurability and negative-path coverage for NL->patch conversion.
+- Align control-flow semantics wording with actual bounded model conversion behavior.
+
+### Decisions
+- Runtime config:
+  - added `runtime.nl_patch_min_confidence` with env override `NEURONIUM_RUNTIME_NL_PATCH_MIN_CONFIDENCE`.
+- Control semantics wording:
+  - `apply_control(...)` doc now explicitly states no user-plan DAG execution while allowing bounded internal conversion step for `revise` (`answer_text -> patch`).
+- NL conversion gate:
+  - replaced hardcoded `0.5` with `self.config.runtime.nl_patch_min_confidence`.
+- Tests hardening in `tests/test_supervised_clarification_flow.py`:
+  - invalid JSON from conversion model => `patch=[]`, status `invalid_json`;
+  - low-confidence conversion => `patch=[]`, status `needs_clarification`;
+  - configurable threshold respected (e.g. `0.95` blocks previous happy-path payload).
+
+### Verification
+- Targeted:
+  - `uv run pytest tests/test_supervised_clarification_flow.py tests/test_cli_bug5_pause_flow.py -q`
+  - Result: `10 passed in 0.92s`
+- Regression:
+  - `uv run pytest tests/test_state_patch.py tests/test_phase2_dynamic_extraction_schema.py tests/test_planner_backend_contract.py tests/test_htn_recursive_backend_integration.py -q`
+  - Result: `23 passed in 0.29s`
+- Lint:
+  - no errors in updated files.
+
+### Outcome
+- Main review concerns are closed in-place:
+  - threshold is policy-configurable,
+  - negative cases are tested,
+  - control semantics text is no longer contradictory to runtime behavior.
+
+### Handoff note
+- Next optional step: move NL->patch conversion out of `apply_control` into a dedicated control service if strict “purely declarative control” boundary is required by architecture governance.
