@@ -614,3 +614,39 @@
 ### Handoff note
 - Следующий шаг по hardening: добавить 1-2 edge-case теста на пустой/частично битый artifact payload
   (request/response), чтобы явно зафиксировать degrade-safe поведение envelope builder без падения runbook.
+
+## 2026-02-24 — PR #10 conflict resolution + BUG-4 hardening iteration
+
+### Plan
+- Разрешить merge-конфликт PR #10 с `main` без потери task-memory.
+- Закрыть выявленные review-risks без отдельного PR:
+  - гарантировать latest-wins семантику для clarification контекста в replay metadata inference;
+  - добавить edge-case тест на degrade-safe поведение envelope при отсутствующих artifacts.
+
+### Decisions
+- Конфликт при `git merge origin/main` был только в `tasks/todo.md`; разрешён сохранением обеих историй записей.
+- `neuronium_agent/core/orchestrator.py` (`_infer_runbook_metadata`):
+  - добавлены флаги `seen_clarification_request/response/evidence`;
+  - при обратном обходе trace-events теперь фиксируется первое найденное значение, т.е. newest контекст не затирается более старыми событиями.
+- `tests/test_checkpoints_and_control.py`:
+  - добавлен тест `test_infer_runbook_metadata_prefers_latest_clarification_context`;
+  - добавлен тест `test_clarification_context_envelope_degrades_safely_for_missing_artifacts`.
+
+### Verification
+- Прогон:
+  - `uv run pytest -q tests/test_checkpoints_and_control.py tests/test_executor_prompt_context.py tests/test_supervised_clarification_flow.py tests/test_planner_replay_strict.py tests/test_replay.py tests/test_determinism.py tests/test_phase6_clarification_ux.py tests/test_cli_bug5_pause_flow.py`
+  - Результат: `68 passed in 2.19s`.
+- Lint check:
+  - `neuronium_agent/core/orchestrator.py`
+  - `tests/test_checkpoints_and_control.py`
+  - `tasks/todo.md`
+  - Результат: no linter errors.
+
+### Outcome
+- Конфликт в PR устранён.
+- BUG-4 hardening усилен:
+  - replay metadata inference сохраняет именно актуальный clarification context;
+  - envelope builder подтверждён как fail-safe при отсутствующих artifacts.
+
+### Handoff note
+- После push проверить статус PR checks и обновить описание PR кратким блоком про latest-wins fix + новые edge-case тесты.

@@ -1513,6 +1513,9 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """Best-effort: reconstruct metadata dict from trace events for replay."""
         metadata: dict[str, Any] = {"runbook_id": runbook_id}
+        seen_clarification_request = False
+        seen_clarification_response = False
+        seen_clarification_evidence = False
         try:
             events = list(self.index_store.get_trace_events(trace_id))
         except Exception:
@@ -1533,10 +1536,12 @@ class Orchestrator:
                     resp_aid = str(
                         control_payload.get("clarification_response_artifact_id", "")
                     ).strip()
-                    if req_aid:
+                    if req_aid and not seen_clarification_request:
                         metadata["clarification_request_artifact_id"] = req_aid
-                    if resp_aid:
+                        seen_clarification_request = True
+                    if resp_aid and not seen_clarification_response:
                         metadata["clarification_response_artifact_id"] = resp_aid
+                        seen_clarification_response = True
 
                     patch_ops = self._normalise_patch_ops(control_payload.get("patch"))
                     if not patch_ops:
@@ -1553,13 +1558,15 @@ class Orchestrator:
                             )
             if description == "Escalation requested":
                 req_aid = str(payload.get("clarification_request_artifact_id", "")).strip()
-                if req_aid:
+                if req_aid and not seen_clarification_request:
                     metadata["clarification_request_artifact_id"] = req_aid
+                    seen_clarification_request = True
                 evidence_ids = payload.get("evidence_artifact_ids", [])
-                if isinstance(evidence_ids, list):
+                if isinstance(evidence_ids, list) and not seen_clarification_evidence:
                     metadata["clarification_evidence_artifact_ids"] = [
                         str(aid) for aid in evidence_ids if str(aid).strip()
                     ]
+                    seen_clarification_evidence = True
             # Pick up doc_paths for docs_report_v1
             if (
                 payload.get("runbook_id") == runbook_id
