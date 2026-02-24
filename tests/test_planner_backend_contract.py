@@ -4,6 +4,7 @@ import json
 
 from neuronium_agent.nodes.base import NodeOutput
 from neuronium_agent.planning.dag import ActionGraph, GraphMetadata, GraphNode
+from neuronium_agent.planning.extraction_contract import ExtractedIntent, ExtractionEnvelope
 from neuronium_agent.planning.planner_backend import get_planner_backend
 from neuronium_agent.planning.planner_contract import DynamicPlannerSpec, PlannerRequest
 
@@ -526,3 +527,30 @@ def test_htn_recursive_backend_dynamic_schema_validation_escalates_with_tool_req
         if isinstance(item, dict)
     }
     assert {"url", "root", "pattern"} <= fields
+
+
+def test_htn_recursive_backend_missing_is_not_driven_by_task_type_when_schema_absent() -> None:
+    backend = get_planner_backend("htn_recursive_v0")
+    request = PlannerRequest(
+        objective="write file",
+        constraints=[],
+        metadata={"output_text": "hello"},
+        runbook_id="super_agent_v0",
+        stage_id="super_agent_v0:stage1",
+        execution_id="phase4noschema001",
+        spec=DynamicPlannerSpec(
+            backend_name="htn_recursive_v0",
+            backend_version="0",
+            allowed_tool_names=[],
+        ),
+        operator_catalog_hash="hash-phase4",
+    )
+    missing = backend._compute_missing_fields(  # type: ignore[attr-defined]
+        request=request,
+        envelope=ExtractionEnvelope(intent=ExtractedIntent(task_type="write_file")),
+        metadata={"output_text": "hello"},
+        dynamic_input_schema=None,
+    )
+    fields = {m.field for m in missing}
+    assert "source" in fields
+    assert "output_filename" not in fields

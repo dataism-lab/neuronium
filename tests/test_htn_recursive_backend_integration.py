@@ -69,6 +69,7 @@ _REPLAY_MAP: dict[str, list[dict]] = {
 def _make_runner(
     tmp_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
+    replay_map: dict[str, list[dict]] | None = None,
 ) -> AgentRunner:
     monkeypatch.setenv("NEURONIUM_OPENAI_API_KEY", "test-fake-key")
 
@@ -87,9 +88,10 @@ def _make_runner(
 
     def patched_build(graph, *, stage_default_model_id=None, **kwargs):
         registry = orig_build(graph, stage_default_model_id=stage_default_model_id, **kwargs)
+        active_replay_map = replay_map if replay_map is not None else _REPLAY_MAP
         for nid, node in registry.items():
-            if hasattr(node, "set_replay_responses") and nid in _REPLAY_MAP:
-                node.set_replay_responses(_REPLAY_MAP[nid])
+            if hasattr(node, "set_replay_responses") and nid in active_replay_map:
+                node.set_replay_responses(active_replay_map[nid])
         return registry
 
     runner._orchestrator._build_node_registry = patched_build  # type: ignore[method-assign]
@@ -126,3 +128,44 @@ def test_htn_recursive_backend_stage_runs_with_dynamic_commit(
     trace_payload = payload.get("planner_decision_trace", {})
     assert trace_payload
     assert trace_payload.get("notes", {}).get("context_kind") == "docs"
+
+
+def test_htn_recursive_backend_stage_pauses_on_schema_driven_missing_source(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    replay_map = dict(_REPLAY_MAP)
+    replay_map["htn_method_select_extract_envelope"] = [{
+        "outputs": {
+            "parsed": {
+                "intent": {"task_type": "generic_task", "confidence": 0.9},
+                "inputs": {},
+                "missing_fields": [],
+                "extras": {},
+            },
+        },
+        "quality_signals": {"tokens_used": 8},
+        "status": "COMPLETED",
+    }]
+    replay_map["htn_method_select_clarification_questions"] = [{
+        "outputs": {"parsed": {"questions": []}},
+        "quality_signals": {"tokens_used": 5},
+        "status": "COMPLETED",
+    }]
+    replay_map["persist_clarification_request"] = [{
+        "outputs": {"artifact_id": "sha256:clarify-integration-001"},
+        "quality_signals": {},
+        "status": "COMPLETED",
+    }]
+    runner = _make_runner(tmp_dir, monkeypatch, replay_map=replay_map)
+
+    handle = runner.start(RunRequest(
+        objective="Do something without source",
+        metadata={"runbook_id": "htn_recursive_demo_v0"},
+        mode="supervised",
+    ))
+    status = runner.get_status(handle)
+    assert status.state == "PAUSED"
+    pause_context = runner.get_latest_pause_context(handle.trace_id)
+    assert pause_context is not None
+    assert str(pause_context.get("clarification_request_artifact_id", "")).strip()

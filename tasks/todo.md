@@ -241,3 +241,111 @@
 ### Handoff note
 - Phase 3 implementation should consume `ToolSchemaRegistry` from `neuronium_agent.schemas.tool_schema_registry`.
 - Keep legacy `answers` support via bridge during phase 3; remove legacy path only after dedicated compatibility acceptance.
+
+## 2026-02-24 — Phase 3 implementation: revise/merge → patch-first
+
+### Plan
+- Switch `revise` to patch-first payload handling in orchestrator.
+- Remove per-field answers merge from metadata inference and replace with `apply_patch`.
+- Preserve backward compatibility via legacy `answers` → `patch` bridge and verify with targeted tests.
+
+### Decisions
+- `control(revise)` now normalizes payload patch operations via `_normalise_patch_ops(...)`.
+- Legacy `answers` are accepted but converted by `_legacy_answers_to_patch(...)`; normalized patch is persisted and recorded as the canonical revise payload.
+- Clarification response artifact now stores:
+  - `patch` (canonical),
+  - `legacy_answers` (only when provided, audit/compat bridge),
+  - `answer_text` and `request_artifact_id`.
+- `_infer_runbook_metadata(...)` now applies revise updates through `apply_patch(...)` and no longer contains per-field branches (`url/doc_paths/output_text/...`).
+- Added helper methods in orchestrator for deterministic bridge behavior:
+  - `_normalise_patch_ops(...)`,
+  - `_legacy_answers_to_patch(...)`,
+  - `_normalize_legacy_answer_value(...)`,
+  - `_pointer_escape_token(...)`.
+
+### Verification
+- Added/updated tests:
+  - `tests/test_supervised_clarification_flow.py`
+    - asserts revise event contains canonical `patch`,
+    - validates clarification response artifact stores `patch` (+ `legacy_answers` for old path),
+    - adds patch-native revise scenario (`payload.patch` without `answers`).
+  - `tests/test_state_patch.py`
+    - adds escaped JSON pointer token coverage.
+- Ran:
+  - `uv run pytest tests/test_state_patch.py tests/test_supervised_clarification_flow.py tests/test_cli_bug5_pause_flow.py tests/test_resume_dispatch_and_docs_report_best_effort.py tests/test_phase2_dynamic_extraction_schema.py -q`
+- Result:
+  - `20 passed in 0.73s`
+- Lint check on edited files:
+  - `neuronium_agent/core/orchestrator.py`
+  - `neuronium_agent/types.py`
+  - `tests/test_supervised_clarification_flow.py`
+  - `tests/test_state_patch.py`
+  - Result: no linter errors.
+
+### Outcome
+- Phase 3 core acceptance implemented:
+  - revise path is patch-first,
+  - metadata/replay resume integration is patch-driven,
+  - legacy `answers` remains supported via bridge.
+- Orchestrator no longer relies on per-field answer merge logic for revise integration.
+
+### Handoff note
+- Next migration step can remove legacy `answers` bridge only after explicit compatibility deprecation window.
+- For phase 4, reuse patch-native revise trail and proceed with full schema-driven missing-slots replacement.
+
+## 2026-02-24 — Phase 4 implementation: schema-driven missing slots
+
+### Plan
+- Make schema-driven missing computation the primary runtime path in HTN backend.
+- Remove active task-type/per-field missing logic branches and keep only a technical fallback.
+- Prove compatibility with targeted acceptance/regression tests.
+
+### Decisions
+- `neuronium_agent/planning/htn_recursive_backend.py`:
+  - `_compute_missing_fields(...)` now always goes through schema-based flow:
+    - uses provided `dynamic_input_schema` when available;
+    - otherwise builds runtime schema via `_build_runtime_input_schema(...)`.
+  - Removed active task-type branch logic (`news_summary/docs_summary/write_file/generic_task`) from missing computation path.
+  - Added minimal fallback path (`_compute_missing_fields_fallback(...)`) used only when schema path is unavailable/throws.
+  - Missing dedupe is now path-oriented:
+    - schema slots are keyed by JSON pointer path;
+    - model-signaled critical fields are normalized to path with `_legacy_field_to_pointer(...)`;
+    - deterministic output order is sorted by path.
+  - Added helper methods:
+    - `_build_runtime_input_schema(...)`,
+    - `_default_schema_for_field(...)`,
+    - `_metadata_has_value_for_key(...)`,
+    - `_legacy_field_to_pointer(...)`,
+    - `_compute_missing_fields_fallback(...)`.
+- Compatibility behavior:
+  - Legacy `missing_fields` output shape is preserved for consumers.
+  - Generic no-source scenario remains represented via `source`.
+
+### Verification
+- Updated tests:
+  - `tests/test_phase2_dynamic_extraction_schema.py`
+    - renamed legacy fallback assertion to phase-4 schema-driven baseline behavior;
+    - added deterministic dedupe test for duplicate `url` signals.
+  - `tests/test_planner_backend_contract.py`
+    - added test proving missing computation is no longer task-type-driven when schema is absent.
+  - `tests/test_htn_recursive_backend_integration.py`
+    - added integration test that run pauses with schema-driven missing `source` and emits clarification request.
+- Ran acceptance tests:
+  - `uv run pytest tests/test_phase2_dynamic_extraction_schema.py tests/test_planner_backend_contract.py tests/test_htn_recursive_backend_integration.py -q`
+  - Result: `19 passed in 0.43s`
+- Ran regression tests:
+  - `uv run pytest tests/test_supervised_clarification_flow.py tests/test_cli_bug5_pause_flow.py -q`
+  - Result: `6 passed in 0.42s`
+- Lint check:
+  - no linter errors in edited files.
+
+### Outcome
+- Phase 4 target reached for planner backend path:
+  - schema-driven missing is primary;
+  - active task-type/per-field missing branches removed;
+  - deterministic path-based dedupe added;
+  - clarification flow compatibility preserved and verified.
+
+### Handoff note
+- Next phase should focus on NL feedback to `StatePatch` (phase 5) without reintroducing field-specific merge rules.
+- If stricter schema inference is needed, evolve `_build_runtime_input_schema(...)` incrementally and guard changes with regression tests first.

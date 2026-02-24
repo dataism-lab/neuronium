@@ -727,120 +727,43 @@ class HtnRecursivePlannerBackend:
         metadata: dict[str, Any],
         dynamic_input_schema: dict[str, Any] | None = None,
     ) -> list[MissingField]:
-        if dynamic_input_schema is not None:
+        schema = (
+            dynamic_input_schema
+            if isinstance(dynamic_input_schema, dict)
+            else self._build_runtime_input_schema(envelope=envelope, metadata=metadata)
+        )
+        if not isinstance(schema, dict):
+            logger.warning("Missing input schema for planner validation; using fallback missing computation.")
+            return self._compute_missing_fields_fallback(envelope=envelope, metadata=metadata)
+        try:
             return self._compute_schema_missing_fields(
                 envelope=envelope,
                 metadata=metadata,
-                input_schema=dynamic_input_schema,
+                input_schema=schema,
             )
+        except Exception as exc:
+            logger.warning("Schema-driven missing computation failed, fallback activated: %s", exc)
+            return self._compute_missing_fields_fallback(envelope=envelope, metadata=metadata)
 
-        task_type = self._effective_task_type(
-            requested_task_type=envelope.intent.task_type or "generic_task",
-            metadata=metadata,
-        )
-        urls = metadata.get("urls") if isinstance(metadata.get("urls"), list) else []
-        doc_paths = metadata.get("doc_paths") if isinstance(metadata.get("doc_paths"), list) else []
-        output_filename = metadata.get("output_filename")
-        output_text = metadata.get("output_text")
-        unresolved_doc_paths = (
-            metadata.get("unresolved_doc_paths")
-            if isinstance(metadata.get("unresolved_doc_paths"), list)
-            else []
-        )
-
-        missing: list[MissingField] = []
-        for mf in envelope.missing_fields:
-            key = mf.field.removeprefix("inputs.") if mf.field.startswith("inputs.") else mf.field
-            if key == "url" and urls:
-                continue
-            if key == "doc_paths" and doc_paths:
-                continue
-            if key == "output_filename" and isinstance(output_filename, str) and output_filename.strip():
-                continue
-            if key == "output_text" and isinstance(output_text, str) and output_text.strip():
-                continue
-            if task_type != "write_file" and key in {"output_filename", "output_text"}:
-                continue
-            if key == "source" and (urls or doc_paths):
-                continue
-            if key == "doc_paths" and urls:
-                continue
-            if mf.critical:
-                normalized = MissingField(field=key, reason=mf.reason, critical=mf.critical) if key != mf.field else mf
-                missing.append(normalized)
-
-        if unresolved_doc_paths and not urls:
-            missing.append(MissingField(
-                field="doc_paths",
-                reason=(
-                    "Could not resolve doc_paths uniquely: "
-                    + ", ".join(str(x) for x in unresolved_doc_paths)
-                ),
-                critical=True,
-            ))
-
-        if task_type in {"news_summary", "web_summary"} and not urls:
-            missing.append(MissingField(
-                field="url",
-                reason="URL is required for web summary",
-                critical=True,
-            ))
-        if task_type in {"docs_summary"} and not doc_paths and not urls:
-            missing.append(MissingField(
-                field="doc_paths",
-                reason="Document paths are required for docs summary",
-                critical=True,
-            ))
-        if task_type == "write_file":
-            if not (isinstance(output_filename, str) and output_filename.strip()):
-                missing.append(MissingField(
-                    field="output_filename",
-                    reason="Filename is required for file task",
-                    critical=True,
-                ))
-            if not (isinstance(output_text, str) and output_text.strip()):
-                missing.append(MissingField(
-                    field="output_text",
-                    reason="Text content is required for file task",
-                    critical=True,
-                ))
-        if task_type == "generic_task" and not urls and not doc_paths:
-            missing.append(MissingField(
-                field="source",
-                reason="Need at least one source: URL or doc path",
-                critical=True,
-            ))
-
-        # If we already have specific actionable missing fields, avoid a vague
-        # umbrella "source" question to reduce redundant clarifications.
-        # This keeps the UI/CLI flow clean (e.g. only ask for url if web summary).
-        if any(m.field in {"url", "doc_paths"} for m in missing):
-            missing = [m for m in missing if m.field != "source"]
-
-        # Stable dedupe by field+reason
-        dedup: dict[tuple[str, str], MissingField] = {}
-        for mf in missing:
-            dedup[(mf.field, mf.reason)] = mf
-        return [dedup[k] for k in sorted(dedup)]
-
-    @staticmethod
+    @classmethod
     def _compute_schema_missing_fields(
+        cls,
         *,
         envelope: ExtractionEnvelope,
         metadata: dict[str, Any],
         input_schema: dict[str, Any],
     ) -> list[MissingField]:
-        missing: list[MissingField] = []
+        missing_by_path: dict[str, MissingField] = {}
         schema_slots = compute_missing_slots(
             state=metadata,
             input_schema=input_schema,
         )
         for slot in schema_slots:
-            missing.append(MissingField(
+            missing_by_path[slot.path] = MissingField(
                 field=slot_path_to_legacy_field(slot.path),
                 reason=slot.reason,
                 critical=slot.critical,
-            ))
+            )
 
         # Keep critical model-signaled gaps that belong to current dynamic schema.
         schema_properties = input_schema.get("properties", {})
@@ -855,12 +778,113 @@ class HtnRecursivePlannerBackend:
                 continue
             if key not in allowed_keys:
                 continue
-            missing.append(MissingField(field=key, reason=mf.reason, critical=True))
+            if cls._metadata_has_value_for_key(metadata, key):
+                continue
+            path = cls._legacy_field_to_pointer(key)
+            missing_by_path[path] = MissingField(field=key, reason=mf.reason, critical=True)
 
-        dedup: dict[tuple[str, str], MissingField] = {}
-        for mf in missing:
-            dedup[(mf.field, mf.reason)] = mf
-        return [dedup[k] for k in sorted(dedup)]
+        if "/source" in missing_by_path and ("/url" in missing_by_path or "/doc_paths" in missing_by_path):
+            missing_by_path.pop("/source", None)
+        return [missing_by_path[path] for path in sorted(missing_by_path)]
+
+    @classmethod
+    def _build_runtime_input_schema(
+        cls,
+        *,
+        envelope: ExtractionEnvelope,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        required: set[str] = set()
+        properties: dict[str, dict[str, Any]] = {}
+        for mf in envelope.missing_fields:
+            key = mf.field.removeprefix("inputs.") if mf.field.startswith("inputs.") else mf.field
+            if not mf.critical or not key:
+                continue
+            required.add(key)
+            properties.setdefault(key, cls._default_schema_for_field(key))
+
+        unresolved_doc_paths = metadata.get("unresolved_doc_paths")
+        if isinstance(unresolved_doc_paths, list) and unresolved_doc_paths:
+            required.add("doc_paths")
+            properties.setdefault("doc_paths", {"type": "array", "items": {"type": "string"}})
+
+        urls = metadata.get("urls") if isinstance(metadata.get("urls"), list) else []
+        urls = [str(x).strip() for x in urls if str(x).strip()]
+        doc_paths = metadata.get("doc_paths") if isinstance(metadata.get("doc_paths"), list) else []
+        doc_paths = [str(x).strip() for x in doc_paths if str(x).strip()]
+        if not urls and not doc_paths and not ({"url", "doc_paths", "source"} & required):
+            required.add("source")
+            properties.setdefault("source", {"type": "string"})
+
+        for key in sorted(set(metadata.keys())):
+            if key in properties:
+                continue
+            if key.startswith("_"):
+                continue
+            if key == "unresolved_doc_paths":
+                continue
+            if isinstance(metadata.get(key), list):
+                properties[key] = {"type": "array", "items": {"type": "string"}}
+            else:
+                properties[key] = {"type": ["string", "number", "boolean", "object", "array", "null"]}
+
+        return {
+            "type": "object",
+            "additionalProperties": True,
+            "required": sorted(required),
+            "properties": properties,
+        }
+
+    @staticmethod
+    def _default_schema_for_field(field: str) -> dict[str, Any]:
+        if field in {"urls", "doc_paths"} or field.endswith("_paths"):
+            return {"type": "array", "items": {"type": "string"}}
+        if field in {"source", "url", "output_filename", "output_text", "output_format", "language"}:
+            return {"type": "string"}
+        return {"type": ["string", "number", "boolean", "object", "array", "null"]}
+
+    @staticmethod
+    def _metadata_has_value_for_key(metadata: dict[str, Any], key: str) -> bool:
+        value = metadata.get(key)
+        if isinstance(value, str):
+            return bool(value.strip())
+        if isinstance(value, list):
+            return any(
+                (isinstance(x, str) and x.strip()) or (not isinstance(x, str) and x is not None)
+                for x in value
+            )
+        return value is not None
+
+    @staticmethod
+    def _legacy_field_to_pointer(field: str) -> str:
+        return "/" + field.replace("~", "~0").replace("/", "~1")
+
+    @classmethod
+    def _compute_missing_fields_fallback(
+        cls,
+        *,
+        envelope: ExtractionEnvelope,
+        metadata: dict[str, Any],
+    ) -> list[MissingField]:
+        fallback_schema = cls._build_runtime_input_schema(envelope=envelope, metadata=metadata)
+        schema_slots = compute_missing_slots(state=metadata, input_schema=fallback_schema)
+        out: list[MissingField] = [
+            MissingField(
+                field=slot_path_to_legacy_field(slot.path),
+                reason=slot.reason,
+                critical=slot.critical,
+            )
+            for slot in schema_slots
+        ]
+        if out:
+            return out
+        return [
+            MissingField(
+                field="source",
+                reason="Need at least one source: URL or doc path",
+                critical=True,
+            )
+        ]
 
     def _build_clarification_request(
         self,

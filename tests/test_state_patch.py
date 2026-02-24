@@ -40,3 +40,11 @@ def test_apply_patch_raises_deterministic_error_for_missing_path() -> None:
             {"inputs": {}},
             [PatchOperation(op="replace", path="/inputs/path", value="/tmp/x.md")],
         )
+
+
+def test_apply_patch_supports_escaped_json_pointer_tokens() -> None:
+    patched = apply_patch(
+        {"inputs": {}},
+        [{"op": "add", "path": "/inputs/a~1b", "value": "ok"}],
+    )
+    assert patched == {"inputs": {"a/b": "ok"}}
