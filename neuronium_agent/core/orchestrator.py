@@ -45,7 +45,7 @@ from neuronium_agent.nodes.base import BaseNode, NodeOutput
 from neuronium_agent.nodes.code_node import CodeNode
 from neuronium_agent.nodes.mcp_node import McpToolNode
 from neuronium_agent.nodes.model_node import ModelNode
-from neuronium_agent.planning.dag import ActionGraph
+from neuronium_agent.planning.dag import ActionGraph, GraphMetadata, GraphNode
 from neuronium_agent.planning.dynamic_planner import validate_planned_graph
 from neuronium_agent.planning.htn import HTNPlanner
 from neuronium_agent.planning.operator_catalog import OperatorCatalog
@@ -340,7 +340,7 @@ class Orchestrator:
         return self._recorders.get(trace_id)
 
     # ------------------------------------------------------------------
-    # Declarative meta-control (no DAG execution)
+    # Declarative meta-control (no user plan DAG execution)
     # ------------------------------------------------------------------
 
     def apply_control(
@@ -351,7 +351,9 @@ class Orchestrator:
         """Apply a control command **declaratively**.
 
         Performs: state transition → checkpoint → trace decision.
-        Never executes DAG nodes or triggers orchestration.
+        Does not execute user plan DAGs or trigger stage orchestration.
+        Note: revise may perform a bounded internal model conversion step
+        (`answer_text -> patch`) when no structured patch/answers are provided.
         """
         state = self._states.get(trace_id)
         recorder = self._recorders.get(trace_id)
@@ -436,9 +438,19 @@ class Orchestrator:
             request_artifact_id = str(
                 payload.get("clarification_request_artifact_id", "")
             ).strip()
+            nl_conversion: dict[str, Any] | None = None
+            if not patch_ops and not answers and answer_text:
+                patch_ops, nl_conversion = self._convert_nl_answer_to_patch(
+                    state=state,
+                    recorder=recorder,
+                    answer_text=answer_text,
+                    clarification_request_artifact_id=request_artifact_id,
+                )
 
             decision_payload = dict(payload)
             decision_payload["patch"] = patch_ops
+            if nl_conversion is not None:
+                decision_payload["nl_patch_conversion"] = nl_conversion
             if answers or answer_text or patch_ops:
                 plan_id = (
                     state.intention.plan_id
@@ -452,6 +464,8 @@ class Orchestrator:
                 }
                 if answers:
                     response_payload["legacy_answers"] = answers
+                if nl_conversion is not None:
+                    response_payload["nl_patch_conversion"] = nl_conversion
                 response_artifact_id = self._persist_control_artifact(
                     artifact_type="planner.clarification_response",
                     payload=response_payload,
@@ -1567,6 +1581,213 @@ class Orchestrator:
                 entry["value"] = op.value
             normalized.append(entry)
         return normalized
+
+    def _convert_nl_answer_to_patch(
+        self,
+        *,
+        state: AgentState,
+        recorder: TraceRecorder,
+        answer_text: str,
+        clarification_request_artifact_id: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        """Convert NL clarification answer into RFC6902 patch operations."""
+        context_payload = self._load_artifact_json_or_empty(clarification_request_artifact_id)
+        slots = self._extract_clarification_slots(context_payload)
+        if not slots:
+            return [], {
+                "status": "skipped_no_slots",
+                "clarification_request_artifact_id": clarification_request_artifact_id,
+            }
+
+        prompt = (
+            "Преобразуй ответ пользователя в JSON Patch для метаданных запуска.\n"
+            "Используй только перечисленные слоты, не добавляй новые пути.\n"
+            "Верни строгий JSON по схеме.\n\n"
+            f"Answer text: {answer_text}\n"
+            f"Clarification slots: {json.dumps(slots, ensure_ascii=False)}\n"
+        )
+        node_id = "control_nl_to_patch"
+        graph = ActionGraph(
+            metadata=GraphMetadata(
+                plan_id=f"control-nl-patch-{state.execution_id[:12]}",
+                description="Convert NL clarification answer to patch",
+            ),
+            nodes=[
+                GraphNode(
+                    node_id=node_id,
+                    node_type="model",
+                    parameters={
+                        "system_prompt": (
+                            "You map user clarification text to state patch operations. "
+                            "If data is ambiguous or insufficient, set needs_clarification=true."
+                        ),
+                        "json_schema": self._nl_patch_conversion_schema(),
+                        "timeout_seconds": 60,
+                        "max_retries": 1,
+                    },
+                )
+            ],
+            edges=[],
+        )
+        try:
+            raw_outputs = self._execute(
+                state,
+                graph,
+                recorder,
+                initial_inputs_override={"prompt": prompt},
+            )
+            outputs = raw_outputs.results if isinstance(raw_outputs, ExecutionOutcome) else raw_outputs
+            parsed = self._parse_json_object_output(outputs.get(node_id))
+            if parsed is None:
+                return [], {
+                    "status": "invalid_json",
+                    "clarification_request_artifact_id": clarification_request_artifact_id,
+                }
+
+            needs_clarification = bool(parsed.get("needs_clarification", False))
+            confidence_raw = parsed.get("confidence", 0.0)
+            confidence = float(confidence_raw) if isinstance(confidence_raw, (int, float)) else 0.0
+            rationale = str(parsed.get("rationale", "")).strip()
+            if needs_clarification or confidence < self.config.runtime.nl_patch_min_confidence:
+                return [], {
+                    "status": "needs_clarification",
+                    "confidence": confidence,
+                    "rationale": rationale,
+                    "clarification_request_artifact_id": clarification_request_artifact_id,
+                }
+
+            patch_ops = self._normalise_patch_ops(parsed.get("patch"))
+            if not patch_ops:
+                return [], {
+                    "status": "empty_patch",
+                    "confidence": confidence,
+                    "rationale": rationale,
+                    "clarification_request_artifact_id": clarification_request_artifact_id,
+                }
+            return patch_ops, {
+                "status": "ok",
+                "confidence": confidence,
+                "rationale": rationale,
+                "op_count": len(patch_ops),
+                "clarification_request_artifact_id": clarification_request_artifact_id,
+            }
+        except Exception as exc:
+            logger.warning("NL->patch conversion failed: %s", exc)
+            return [], {
+                "status": "error",
+                "reason": str(exc),
+                "clarification_request_artifact_id": clarification_request_artifact_id,
+            }
+
+    def _load_artifact_json_or_empty(self, artifact_id_value: str) -> dict[str, Any]:
+        aid = str(artifact_id_value).strip()
+        if not aid:
+            return {}
+        try:
+            raw = self.blob_store.get(aid)
+            payload = json.loads(raw.decode("utf-8"))
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    @classmethod
+    def _extract_clarification_slots(cls, clarification_payload: dict[str, Any]) -> list[dict[str, Any]]:
+        slots: list[dict[str, Any]] = []
+        questions = clarification_payload.get("questions", [])
+        if isinstance(questions, list):
+            for item in questions:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("key", "")).strip()
+                if not key:
+                    continue
+                path = str(item.get("path", "")).strip() or f"/{cls._pointer_escape_token(key)}"
+                expected_schema = item.get("expected_schema")
+                if not isinstance(expected_schema, dict):
+                    expected_schema = cls._legacy_expected_schema(key)
+                slots.append(
+                    {
+                        "key": key,
+                        "path": path,
+                        "expected_schema": expected_schema,
+                        "required": bool(item.get("required", True)),
+                    }
+                )
+        if slots:
+            return slots
+
+        missing_fields = clarification_payload.get("missing_fields", [])
+        if isinstance(missing_fields, list):
+            for item in missing_fields:
+                if not isinstance(item, dict):
+                    continue
+                key = str(item.get("field", "")).strip()
+                if not key:
+                    continue
+                slots.append(
+                    {
+                        "key": key,
+                        "path": f"/{cls._pointer_escape_token(key)}",
+                        "expected_schema": cls._legacy_expected_schema(key),
+                        "required": bool(item.get("critical", True)),
+                    }
+                )
+        return slots
+
+    @staticmethod
+    def _legacy_expected_schema(key: str) -> dict[str, Any]:
+        low = key.strip().lower()
+        if low.endswith("s") or "paths" in low or "urls" in low:
+            return {"type": "array", "items": {"type": "string"}}
+        return {"type": "string"}
+
+    @staticmethod
+    def _nl_patch_conversion_schema() -> dict[str, Any]:
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["patch", "needs_clarification", "confidence", "rationale"],
+            "properties": {
+                "patch": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["op", "path"],
+                        "properties": {
+                            "op": {"type": "string", "enum": ["add", "replace", "remove"]},
+                            "path": {"type": "string", "pattern": "^/"},
+                            "value": {},
+                        },
+                    },
+                },
+                "needs_clarification": {"type": "boolean"},
+                "confidence": {"type": "number"},
+                "rationale": {"type": "string"},
+            },
+        }
+
+    @staticmethod
+    def _parse_json_object_output(output: NodeOutput | None) -> dict[str, Any] | None:
+        if output is None or output.status != "COMPLETED":
+            return None
+        parsed = output.outputs.get("parsed")
+        if isinstance(parsed, dict):
+            return parsed
+        if isinstance(parsed, str):
+            try:
+                value = json.loads(parsed)
+            except json.JSONDecodeError:
+                return None
+            return value if isinstance(value, dict) else None
+        content = output.outputs.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return None
+        try:
+            value = json.loads(content)
+        except json.JSONDecodeError:
+            return None
+        return value if isinstance(value, dict) else None
 
     @classmethod
     def _legacy_answers_to_patch(cls, answers: dict[str, Any]) -> list[dict[str, Any]]:

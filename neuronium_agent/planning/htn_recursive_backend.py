@@ -924,8 +924,9 @@ class HtnRecursivePlannerBackend:
             },
         )
 
-    @staticmethod
+    @classmethod
     def _build_clarification_questions_fallback(
+        cls,
         missing_fields: list[MissingField],
     ) -> list[ClarificationQuestion]:
         """Universal deterministic fallback without scenario templates."""
@@ -948,6 +949,8 @@ class HtnRecursivePlannerBackend:
                 ClarificationQuestion(
                     key=key,
                     prompt=prompt,
+                    path=cls._legacy_field_to_pointer(key),
+                    expected_schema=cls._default_schema_for_field(key),
                     expected_type=expected_type,
                     required=bool(mf.critical),
                     examples=[],
@@ -978,6 +981,8 @@ class HtnRecursivePlannerBackend:
                         "properties": {
                             "key": {"type": "string"},
                             "prompt": {"type": "string"},
+                            "path": {"type": "string"},
+                            "expected_schema": {"type": "object"},
                             "expected_type": {"type": "string"},
                             "required": {"type": "boolean"},
                             "examples": {"type": "array", "items": {"type": "string"}},
@@ -1016,7 +1021,9 @@ class HtnRecursivePlannerBackend:
             f"Objective: {request.objective}\n"
             "Missing fields:\n"
             + "\n".join(
-                f"- key={mf.field}; reason={mf.reason}; critical={mf.critical}"
+                f"- key={mf.field}; path={self._legacy_field_to_pointer(str(mf.field))}; "
+                f"expected_schema={json.dumps(self._default_schema_for_field(str(mf.field)), ensure_ascii=False)}; "
+                f"reason={mf.reason}; critical={mf.critical}"
                 for mf in missing_fields
             )
         )
@@ -1035,8 +1042,12 @@ class HtnRecursivePlannerBackend:
             key = str(item.get("key", "")).strip()
             if key not in allowed_keys:
                 continue
+            normalized = dict(item)
+            normalized.setdefault("path", self._legacy_field_to_pointer(key))
+            if not isinstance(normalized.get("expected_schema"), dict):
+                normalized["expected_schema"] = self._default_schema_for_field(key)
             try:
-                out.append(ClarificationQuestion.model_validate(item))
+                out.append(ClarificationQuestion.model_validate(normalized))
             except ValidationError:
                 continue
         return out

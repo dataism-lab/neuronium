@@ -34,6 +34,17 @@ class ControlProtocol:
             "payload": command.payload,
         }
 
+    def classify_feedback_text(self, feedback_text: str) -> dict[str, Any]:
+        """Classify NL feedback into a control intent envelope (IBS §9.2)."""
+        text = str(feedback_text).strip()
+        if not text:
+            return {"action": "clarify", "confidence": 0.0, "payload": {}}
+        return {
+            "action": "revise",
+            "confidence": 0.5,
+            "payload": {"answer_text": text},
+        }
+
     def needs_clarification(self, command: ControlCommand) -> bool:
         """Whether the command is ambiguous and needs clarification.
 

@@ -37,6 +37,8 @@ class ClarificationQuestion(BaseModel):
 
     key: str
     prompt: str
+    path: str | None = None
+    expected_schema: dict[str, Any] = Field(default_factory=dict)
     expected_type: str = "string"
     required: bool = True
     examples: list[str] = Field(default_factory=list)
