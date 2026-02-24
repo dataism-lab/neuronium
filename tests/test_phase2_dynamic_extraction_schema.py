@@ -4,9 +4,16 @@ import os
 
 import pytest
 
-from neuronium_agent.planning.extraction_contract import extraction_envelope_json_schema
+from neuronium_agent.planning.extraction_contract import (
+    ExtractedIntent,
+    ExtractionEnvelope,
+    extraction_envelope_json_schema,
+)
 from neuronium_agent.planning.htn_recursive_backend import HtnRecursivePlannerBackend
+from neuronium_agent.planning.operator_catalog import OperatorCatalog
+from neuronium_agent.planning.operator_contracts import OperatorContract
 from neuronium_agent.planning.planner_contract import DynamicPlannerSpec, PlannerRequest
+from neuronium_agent.planning.tool_schema_registry import ToolSchemaRegistry
 
 
 def _make_request(*, metadata: dict, tools: list[str]) -> PlannerRequest:
@@ -92,3 +99,102 @@ def test_phase2_dynamic_schema_adds_slots_for_new_allowed_tool(
     monkeypatch.delenv("NEURONIUM_DYNAMIC_EXTRACTION_SCHEMA_RUNBOOKS", raising=False)
     monkeypatch.delenv("NEURONIUM_DYNAMIC_EXTRACTION_SCHEMA_STAGES", raising=False)
     assert os.environ.get("NEURONIUM_DYNAMIC_EXTRACTION_SCHEMA") is None
+
+
+def test_phase2_validation_uses_dynamic_schema_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = HtnRecursivePlannerBackend()
+    monkeypatch.setenv("NEURONIUM_DYNAMIC_EXTRACTION_SCHEMA", "1")
+    request = _make_request(
+        metadata={},
+        tools=["web.fetch_html", "fs.glob"],
+    )
+    dynamic_input_schema = backend._build_dynamic_extraction_input_schema(request)
+    assert dynamic_input_schema is not None
+
+    missing = backend._compute_missing_fields(
+        request=request,
+        envelope=ExtractionEnvelope(intent=ExtractedIntent(task_type="generic_task")),
+        metadata={},
+        dynamic_input_schema=dynamic_input_schema,
+    )
+    fields = {m.field for m in missing}
+    assert {"url", "root", "pattern"} <= fields
+
+
+def test_phase2_validation_keeps_legacy_behavior_when_dynamic_schema_absent() -> None:
+    backend = HtnRecursivePlannerBackend()
+    request = _make_request(
+        metadata={},
+        tools=["web.fetch_html", "fs.glob"],
+    )
+
+    missing = backend._compute_missing_fields(
+        request=request,
+        envelope=ExtractionEnvelope(intent=ExtractedIntent(task_type="generic_task")),
+        metadata={},
+        dynamic_input_schema=None,
+    )
+    fields = {m.field for m in missing}
+    assert "source" in fields
+    assert "root" not in fields
+    assert "pattern" not in fields
+
+
+def test_phase2_new_catalog_tool_is_reflected_in_extraction_and_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = HtnRecursivePlannerBackend()
+    base_catalog = OperatorCatalog.default()
+    new_contract = OperatorContract(
+        operator_id="mcp.custom.new_tool",
+        node_type="mcp",
+        tool_name="custom.new_tool",
+        input_schema={
+            "type": "object",
+            "required": ["api_key"],
+            "properties": {
+                "api_key": {"type": "string"},
+                "mode": {"type": "string"},
+            },
+        },
+        output_schema={"type": "object"},
+        deterministic=True,
+        replay_required=True,
+    )
+    patched_catalog = OperatorCatalog(
+        by_operator_id={
+            **base_catalog.by_operator_id,
+            new_contract.operator_id: new_contract,
+        },
+        by_tool_name={
+            **base_catalog.by_tool_name,
+            str(new_contract.tool_name): new_contract,
+        },
+        by_node_type=base_catalog.by_node_type,
+    )
+    patched_registry = ToolSchemaRegistry(operator_catalog=patched_catalog)
+    monkeypatch.setattr(
+        ToolSchemaRegistry,
+        "from_default_catalog",
+        classmethod(lambda cls: patched_registry),
+    )
+    monkeypatch.setenv("NEURONIUM_DYNAMIC_EXTRACTION_SCHEMA", "1")
+    request = _make_request(metadata={}, tools=["custom.new_tool"])
+
+    dynamic_input_schema = backend._build_dynamic_extraction_input_schema(request)
+    assert dynamic_input_schema is not None
+    assert "api_key" in dynamic_input_schema["required"]
+
+    envelope_schema = extraction_envelope_json_schema(input_schema=dynamic_input_schema)
+    assert "api_key" in envelope_schema["properties"]["inputs"]["required"]
+
+    missing = backend._compute_missing_fields(
+        request=request,
+        envelope=ExtractionEnvelope(intent=ExtractedIntent(task_type="generic_task")),
+        metadata={},
+        dynamic_input_schema=dynamic_input_schema,
+    )
+    fields = {m.field for m in missing}
+    assert "api_key" in fields

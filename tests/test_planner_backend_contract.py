@@ -449,3 +449,80 @@ def test_htn_recursive_backend_uses_web_specific_critic_prompt() -> None:
     prompt = str(critic.parameters.get("system_prompt", ""))
     assert "web-summary critic" in prompt
     assert "Do NOT require document keys like doc_000 for web tasks." in prompt
+
+
+def test_htn_recursive_backend_dynamic_schema_validation_escalates_with_tool_required_fields() -> None:
+    backend = get_planner_backend("htn_recursive_v0")
+    request = PlannerRequest(
+        objective="нужен запуск инструмента без параметров",
+        constraints=[],
+        metadata={
+            "dynamic_extraction_schema": True,
+            "dynamic_extraction_schema_runbooks": ["super_agent_v0"],
+            "dynamic_extraction_schema_stages": ["super_agent_v0:stage1"],
+        },
+        runbook_id="super_agent_v0",
+        stage_id="super_agent_v0:stage1",
+        execution_id="phase2val001",
+        spec=DynamicPlannerSpec(
+            backend_name="htn_recursive_v0",
+            backend_version="0",
+            allowed_tool_names=["web.fetch_html", "fs.glob"],
+        ),
+        operator_catalog_hash="hash-phase2-validation",
+    )
+
+    def fake_execute(graph: ActionGraph, initial_inputs: dict[str, object], suppress: bool) -> dict[str, NodeOutput]:
+        _ = initial_inputs, suppress
+        node_ids = {n.node_id for n in graph.nodes}
+        if node_ids == {"persist_user_request", "extract_entities"}:
+            return {
+                "persist_user_request": NodeOutput(
+                    outputs={"artifact_id": "sha256:req-phase2-validation"},
+                    status="COMPLETED",
+                ),
+                "extract_entities": NodeOutput(
+                    outputs={"urls": [], "file_paths": [], "basenames": []},
+                    status="COMPLETED",
+                ),
+            }
+        extract_nodes = [nid for nid in node_ids if nid.endswith("_extract_envelope")]
+        if len(extract_nodes) == 1:
+            return {
+                extract_nodes[0]: NodeOutput(
+                    outputs={
+                        "parsed": {
+                            "intent": {"task_type": "generic_task", "confidence": 0.7},
+                            "inputs": {},
+                            "missing_fields": [],
+                            "extras": {},
+                        }
+                    },
+                    status="COMPLETED",
+                )
+            }
+        clarification_nodes = [nid for nid in node_ids if nid.endswith("_clarification_questions")]
+        if len(clarification_nodes) == 1:
+            return {
+                clarification_nodes[0]: NodeOutput(
+                    outputs={"parsed": {"questions": []}},
+                    status="COMPLETED",
+                )
+            }
+        if node_ids == {"persist_clarification_request"}:
+            return {
+                "persist_clarification_request": NodeOutput(
+                    outputs={"artifact_id": "sha256:clarify-phase2-validation"},
+                    status="COMPLETED",
+                )
+            }
+        raise AssertionError(f"Unexpected planner graph nodes: {sorted(node_ids)}")
+
+    result = backend.plan(request=request, execute_graph=fake_execute)
+    assert result.reason == "missing_critical_parameters"
+    fields = {
+        str(item.get("field", ""))
+        for item in result.missing_fields
+        if isinstance(item, dict)
+    }
+    assert {"url", "root", "pattern"} <= fields
