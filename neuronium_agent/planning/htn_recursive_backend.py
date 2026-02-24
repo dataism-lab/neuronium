@@ -36,7 +36,7 @@ from neuronium_agent.planning.missing_slots import (
     compute_missing_slots,
     slot_path_to_legacy_field,
 )
-from neuronium_agent.planning.tool_schema_registry import ToolSchemaRegistry
+from neuronium_agent.schemas.tool_schema_registry import ToolSchemaRegistry
 from neuronium_agent.verification.business_critic import (
     BUSINESS_CRITIC_SYSTEM_PROMPT,
     WEB_CRITIC_SYSTEM_PROMPT,
