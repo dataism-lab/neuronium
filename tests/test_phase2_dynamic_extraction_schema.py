@@ -123,7 +123,7 @@ def test_phase2_validation_uses_dynamic_schema_when_enabled(
     assert {"url", "root", "pattern"} <= fields
 
 
-def test_phase2_validation_keeps_legacy_behavior_when_dynamic_schema_absent() -> None:
+def test_phase4_validation_uses_schema_driven_baseline_when_dynamic_schema_absent() -> None:
     backend = HtnRecursivePlannerBackend()
     request = _make_request(
         metadata={},
@@ -140,6 +140,28 @@ def test_phase2_validation_keeps_legacy_behavior_when_dynamic_schema_absent() ->
     assert "source" in fields
     assert "root" not in fields
     assert "pattern" not in fields
+
+
+def test_phase4_missing_dedup_is_stable_by_path() -> None:
+    backend = HtnRecursivePlannerBackend()
+    request = _make_request(
+        metadata={},
+        tools=["web.fetch_html"],
+    )
+    missing = backend._compute_missing_fields(
+        request=request,
+        envelope=ExtractionEnvelope(
+            intent=ExtractedIntent(task_type="news_summary"),
+            missing_fields=[
+                {"field": "url", "reason": "need URL", "critical": True},
+                {"field": "inputs.url", "reason": "need URL duplicate", "critical": True},
+            ],
+        ),
+        metadata={},
+        dynamic_input_schema=None,
+    )
+    fields = [m.field for m in missing]
+    assert fields.count("url") == 1
 
 
 def test_phase2_new_catalog_tool_is_reflected_in_extraction_and_missing(
