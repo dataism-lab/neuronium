@@ -12,12 +12,14 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable, Union
 
+from neuronium_agent.execution.outcome import ExecutionOutcome
 from neuronium_agent.nodes.base import BaseNode, NodeContext, NodeInput, NodeOutput
-from neuronium_agent.nodes.decision_node import BRANCH_OUTPUT_KEY
 from neuronium_agent.planning.dag import ActionGraph
+from neuronium_agent.nodes.decision_node import BRANCH_OUTPUT_KEY
 from neuronium_agent.recovery.classifier import classify_failure
+from neuronium_agent.types import InterruptRequest
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,10 @@ class DAGExecutor:
     trace_callback:
         Optional callable invoked with (event_kind, payload) for every
         significant execution event.
+    interrupt_check:
+        Optional callable called after each batch; if it returns an
+        :class:`InterruptRequest`, execution stops and an
+        :class:`ExecutionOutcome` with partial results and pending is returned.
     """
 
     def __init__(
@@ -47,6 +53,7 @@ class DAGExecutor:
         trace_id: str | None = None,
         random_seed: int = 0,
         trace_callback: Any | None = None,
+        interrupt_check: Callable[[], InterruptRequest | None] | None = None,
         max_node_retries: int = 3,
         retry_backoff_base_seconds: float = 1.0,
         retry_count_upgrade_threshold: int = 2,
@@ -57,6 +64,7 @@ class DAGExecutor:
         self._trace_id = trace_id or uuid.uuid4().hex
         self._seed = random_seed
         self._trace_cb = trace_callback
+        self._interrupt_check = interrupt_check
         self._max_node_retries = max_node_retries
         self._retry_backoff_base = retry_backoff_base_seconds
         self._retry_count_upgrade_threshold = retry_count_upgrade_threshold
@@ -73,12 +81,37 @@ class DAGExecutor:
         graph: ActionGraph,
         *,
         initial_inputs: dict[str, Any] | None = None,
-    ) -> dict[str, NodeOutput]:
-        """Run the full DAG and return ``{node_id: NodeOutput}``.
+        initial_results: dict[str, NodeOutput] | None = None,
+    ) -> Union[dict[str, NodeOutput], ExecutionOutcome]:
+        """Run the full DAG and return results or an execution outcome.
 
         Respects conditional branches (B3): when a decision node completes,
         its output branch value is recorded; nodes in unselected branches
         are never added to ready and are skipped.
+
+        Parameters
+        ----------
+        initial_results
+            Optional pre-filled node results (e.g. from a mid-execution
+            checkpoint). When provided, only nodes not in this dict are
+            executed; completed and pending are derived from it (resume
+            at exact pause point per spec §6.4.2).
+
+        Return type
+        ----------
+        If ``interrupt_check`` was not passed to the constructor: returns
+        ``dict[str, NodeOutput]`` (all node results), same as before.
+        If ``interrupt_check`` was passed: returns :class:`ExecutionOutcome`
+        with fields ``results`` (completed node outputs), ``pending`` (node
+        ids not yet run; empty on normal completion), and ``interrupted``
+        (set only when the callback returned an :class:`InterruptRequest`).
+
+        Interrupt contract
+        ------------------
+        The optional ``interrupt_check`` callable is invoked after each batch.
+        If it returns an :class:`InterruptRequest`, the loop exits without
+        scheduling further nodes; the current batch is always completed first
+        (graceful at batch boundary per spec §9.1.2).
         """
         initial_inputs = initial_inputs or {}
         order = graph.topological_order()
@@ -89,7 +122,24 @@ class DAGExecutor:
         selected_branches: dict[str, str] = {}
 
         completed: set[str] = set()
-        pending = list(order)
+        pending: list[str]
+        if initial_results:
+            self.results = dict(initial_results)
+            completed = set(initial_results)
+            pending = [nid for nid in order if nid not in initial_results]
+            # Restore selected_branches from completed decision nodes so
+            # nodes in unselected branches stay pruned during resume.
+            for nid, output in initial_results.items():
+                gn = nmap.get(nid)
+                if gn and gn.node_type == "decision" and output.status == "COMPLETED":
+                    branch_key = (gn.parameters or {}).get(
+                        "branch_output_key", BRANCH_OUTPUT_KEY
+                    )
+                    branch_value = output.outputs.get(branch_key)
+                    if branch_value is not None:
+                        selected_branches[nid] = str(branch_value)
+        else:
+            pending = list(order)
 
         while pending:
             # Ready: all predecessors completed and not in an unselected branch
@@ -145,6 +195,21 @@ class DAGExecutor:
                             "branch_label": branch_value,
                         })
 
+            if self._interrupt_check is not None:
+                request = self._interrupt_check()
+                if request is not None:
+                    return ExecutionOutcome(
+                        results=dict(self.results),
+                        pending=list(pending),
+                        interrupted=request,
+                    )
+
+        if self._interrupt_check is not None:
+            return ExecutionOutcome(
+                results=dict(self.results),
+                pending=[],
+                interrupted=None,
+            )
         return self.results
 
     # ------------------------------------------------------------------

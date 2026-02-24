@@ -14,6 +14,8 @@ llm_temperature = 0.0
 mode = "batch"
 max_parallel_nodes = 4
 checkpoint_policy = "on_transition"
+# pause_grace_period_seconds = 30   # optional; default 30 (Spec §9.1.2)
+# stop_grace_period_seconds = 5     # optional; default 5 (Spec §6.2.4)
 
 [storage]
 blob_backend = "fs_cas"
@@ -26,7 +28,7 @@ enabled = false
 
 [llm]
 provider = "openai"
-model = "gpt-4.1-mini"
+model = "gpt-5-nano"
 api_key_env = "NEURONIUM_OPENAI_API_KEY"
 structured_output = true
 timeout_seconds = 60

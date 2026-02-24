@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import queue
 import sys
+import threading
 from typing import Any, TYPE_CHECKING, Callable
 
 import click
@@ -63,31 +66,8 @@ def _interactive_supervised_loop(
             questions = []
 
         click.echo("Run paused: требуется уточнение входных параметров.")
-        # Optional bulk JSON shortcut (fast paste), but default UX is per-question.
-        parsed: dict[str, object] = {}
-        if len(questions) >= 2:
-            click.echo("Можно вставить JSON-объект с ответами (Enter чтобы отвечать по одному).")
-            click.echo('Пример: {"url":"https://...","doc_paths":["a.md","b.md"]}')
-            raw = click.prompt("answers_json (optional)", default="", show_default=False).strip()
-            if raw:
-                try:
-                    obj = json.loads(raw)
-                    if isinstance(obj, dict):
-                        parsed = obj
-                except Exception:
-                    parsed = {}
 
         answers: dict[str, object] = {}
-        # 1) Apply any parsed bulk answers (only for known keys)
-        if parsed:
-            for q in questions:
-                if not isinstance(q, dict):
-                    continue
-                key = str(q.get("key", "")).strip()
-                if key and key in parsed:
-                    answers[key] = parsed[key]
-
-        # 2) Ask remaining questions one-by-one
         for q in questions:
             if not isinstance(q, dict):
                 continue
@@ -144,6 +124,230 @@ def _print_pause_help(runner: AgentRunner, trace_id: str) -> None:
     click.echo("")
     click.echo("Чтобы ответить интерактивно, запусти:")
     click.echo(f"  neuronium-agent run --mode supervised --trace-id {trace_id}")
+
+
+def _read_stdin_line_nonblocking(
+    stop_event: threading.Event,
+    poll_interval: float = 0.15,
+) -> str | None:
+    """Read one line from stdin without blocking indefinitely.
+
+    Uses platform-specific non-blocking I/O so the calling thread can exit
+    promptly when *stop_event* is set — eliminating the stdin race condition
+    between the background input-reader and ``click.prompt()`` in the
+    clarification flow (BUG-1).
+
+    Returns the stripped line, or ``None`` if *stop_event* fired / EOF.
+    """
+    if os.name == "nt":
+        import msvcrt
+
+        buf: list[str] = []
+        while not stop_event.is_set():
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\r", "\n"):
+                    return "".join(buf)
+                if ch == "\x08":  # backspace
+                    if buf:
+                        buf.pop()
+                    continue
+                if ch in ("\x00", "\xe0"):  # special-key prefix
+                    msvcrt.getwch()  # consume second byte
+                    continue
+                buf.append(ch)
+            else:
+                stop_event.wait(poll_interval)
+        return None
+    else:
+        import select as _select
+
+        while not stop_event.is_set():
+            ready, _, _ = _select.select([sys.stdin], [], [], poll_interval)
+            if ready:
+                line = sys.stdin.readline()
+                if not line:
+                    return None
+                return line.strip()
+        return None
+
+
+def _input_reader_loop(
+    command_queue: queue.Queue[str | None],
+    stop_event: threading.Event,
+) -> None:
+    """Run in a daemon thread: read stdin, push 'pause' or 'stop' into queue."""
+    while not stop_event.is_set():
+        try:
+            line = _read_stdin_line_nonblocking(stop_event)
+            if line is None or stop_event.is_set():
+                break
+            line = line.strip().lower()
+            if line in ("q", "quit", "stop"):
+                command_queue.put("stop")
+            elif line in ("p", "pause", ""):
+                command_queue.put("pause")
+        except (EOFError, OSError):
+            break
+
+
+def _run_in_worker(
+    runner: AgentRunner,
+    result_holder: dict[str, Any],
+    *,
+    request: RunRequest | None = None,
+    trace_id: str | None = None,
+) -> None:
+    """Run start(request) or resume_run(trace_id) and store handle/status/exc in result_holder."""
+    try:
+        if trace_id is not None:
+            handle = runner.resume_run(trace_id)
+        elif request is not None:
+            def on_ready(h: RunHandle) -> None:
+                result_holder["handle"] = h
+
+            handle = runner.start(request, on_handle_ready=on_ready)
+        else:
+            raise ValueError("request or trace_id required")
+        result_holder["handle"] = handle
+        result_holder["status"] = runner.get_status(handle)
+        result_holder["exc"] = None
+    except Exception as exc:
+        result_holder["exc"] = exc
+        result_holder["status"] = None
+
+
+def _interactive_run_loop(
+    runner: AgentRunner,
+    *,
+    request: RunRequest | None = None,
+    resume_trace_id: str | None = None,
+) -> tuple[RunHandle, RunStatus]:
+    """Run start or resume in a worker thread; main thread accepts pause/stop and applies control.
+
+    Returns (handle, status) when the run reaches a terminal state or user stop.
+    """
+    command_queue: queue.Queue[str | None] = queue.Queue()
+    stop_input_event = threading.Event()
+    result_holder: dict[str, Any] = {}
+
+    def on_handle_ready(h: RunHandle) -> None:
+        result_holder["handle"] = h
+
+    worker_done = threading.Event()
+
+    def worker_target() -> None:
+        try:
+            if resume_trace_id is not None:
+                handle = runner.resume_run(resume_trace_id)
+            elif request is not None:
+                handle = runner.start(request, on_handle_ready=on_handle_ready)
+            else:
+                raise ValueError("request or resume_trace_id required")
+            result_holder["handle"] = handle
+            result_holder["status"] = runner.get_status(handle)
+            result_holder["exc"] = None
+        except Exception as exc:
+            result_holder["exc"] = exc
+            result_holder["status"] = None
+        finally:
+            worker_done.set()
+
+    worker = threading.Thread(target=worker_target, daemon=False)
+    worker.start()
+
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        input_thread = threading.Thread(
+            target=_input_reader_loop,
+            args=(command_queue, stop_input_event),
+            daemon=True,
+        )
+        input_thread.start()
+        click.echo("Interactive: Enter or p = pause, q = stop")
+    else:
+        input_thread = None
+
+    try:
+        while not worker_done.is_set():
+            worker.join(timeout=0.2)
+            if worker_done.is_set():
+                break
+            try:
+                cmd = command_queue.get_nowait()
+            except queue.Empty:
+                continue
+            handle = result_holder.get("handle")
+            if handle is None:
+                continue
+            if cmd == "stop":
+                runner.control(handle, ControlCommand(type="stop", payload={"mode": "graceful"}))  # type: ignore[arg-type]
+            elif cmd == "pause":
+                runner.control(handle, ControlCommand(type="pause", payload={}))  # type: ignore[arg-type]
+    finally:
+        stop_input_event.set()
+        if input_thread is not None:
+            input_thread.join(timeout=0.5)
+
+    worker.join()
+    if result_holder.get("exc"):
+        raise result_holder["exc"]
+    handle = result_holder["handle"]
+    status = result_holder["status"]
+
+    while status.state == "PAUSED":
+        pause_context = runner.get_latest_pause_context(handle.trace_id)
+        has_clarification = bool(
+            pause_context
+            and str(pause_context.get("clarification_request_artifact_id", "")).strip()
+        )
+        if has_clarification:
+            handle, status = _interactive_supervised_loop(runner, handle)
+            continue
+        click.echo("PAUSED. Press Enter to continue, q to stop.")
+        if not sys.stdin.isatty():
+            break
+        try:
+            line = input().strip().lower()
+        except (EOFError, OSError):
+            break
+        if line in ("q", "quit", "stop"):
+            runner.control(handle, ControlCommand(type="stop", payload={"mode": "graceful"}))  # type: ignore[arg-type]
+            status = runner.get_status(handle)
+            break
+        runner.control(handle, ControlCommand(type="continue", payload={}))  # type: ignore[arg-type]
+        result_holder2: dict[str, Any] = {}
+        w2 = threading.Thread(
+            target=_run_in_worker,
+            args=(runner, result_holder2),
+            kwargs={"trace_id": handle.trace_id},
+            daemon=False,
+        )
+        w2.start()
+        cmd_queue2: queue.Queue[str | None] = queue.Queue()
+        stop2 = threading.Event()
+        if sys.stdin.isatty():
+            inp2 = threading.Thread(target=_input_reader_loop, args=(cmd_queue2, stop2), daemon=True)
+            inp2.start()
+        while w2.is_alive():
+            w2.join(timeout=0.2)
+            try:
+                c = cmd_queue2.get_nowait()
+            except queue.Empty:
+                continue
+            if result_holder2.get("handle") and c == "stop":
+                runner.control(result_holder2["handle"], ControlCommand(type="stop", payload={"mode": "graceful"}))  # type: ignore[arg-type]
+            elif result_holder2.get("handle") and c == "pause":
+                runner.control(result_holder2["handle"], ControlCommand(type="pause", payload={}))  # type: ignore[arg-type]
+        stop2.set()
+        if sys.stdin.isatty():
+            inp2.join(timeout=1.0)
+        w2.join()
+        if result_holder2.get("exc"):
+            raise result_holder2["exc"]
+        handle = result_holder2["handle"]
+        status = result_holder2["status"]
+
+    return handle, status
 
 
 def _extract_latest_plan_payload(events: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -812,9 +1016,9 @@ def cli() -> None:
 @click.option("--config", "config_path", default=None, help="Path to neuronium.toml")
 @click.option(
     "--mode",
-    type=click.Choice(["batch", "supervised"]),
+    type=click.Choice(["batch", "supervised", "interactive"]),
     default=None,
-    help="Execution mode",
+    help="Execution mode. interactive: accept pause/stop during run (Enter/p = pause, q = stop).",
 )
 @click.option("--trace-export", "trace_export", default=None, help="Export trace to path")
 @click.option(
@@ -869,6 +1073,9 @@ def run(
 
     To start a new run:  neuronium-agent run -o "objective"
     To resume a run:     neuronium-agent run --trace-id <id>
+
+    Modes: batch (default), supervised (step confirmation, clarification),
+    interactive (accept pause/stop during run: Enter or p = pause, q = stop).
     """
     cli_overrides: dict = {}
     if mode:
@@ -884,7 +1091,28 @@ def run(
     listener = _build_live_demo_listener(verbose=demo_verbose) if demo_live else None
     runner = create_runner(config, trace_event_listener=listener)
 
-    if resume_trace_id:
+    if config.runtime.mode == "interactive":
+        if objective:
+            constraints: list[str] = []
+            if autofix_inject_bug and runbook_id == "autofix_demo":
+                constraints.append("__NEURONIUM_INTERNAL_DEMO_INJECT_BUG__")
+            request = RunRequest(  # type: ignore[arg-type]
+                objective=objective,
+                constraints=constraints,
+                mode=mode,
+                metadata={"runbook_id": runbook_id},
+            )
+            click.echo(f"Starting run (interactive): {objective}")
+            handle, status = _interactive_run_loop(runner, request=request)
+        elif resume_trace_id:
+            click.echo(f"Resuming run (interactive): trace_id={resume_trace_id}")
+            handle, status = _interactive_run_loop(
+                runner, resume_trace_id=resume_trace_id
+            )
+        else:
+            click.echo("Error: --objective or --trace-id is required.", err=True)
+            sys.exit(1)
+    elif resume_trace_id:
         # Resume path:
         # - If PAUSED and in supervised mode, run interactive loop which will
         #   send revise+continue and then resume.
@@ -900,7 +1128,7 @@ def run(
         )
     elif objective:
         # New run path
-        constraints: list[str] = []
+        constraints = []
         if autofix_inject_bug and runbook_id == "autofix_demo":
             constraints.append("__NEURONIUM_INTERNAL_DEMO_INJECT_BUG__")
         request = RunRequest(  # type: ignore[arg-type]
@@ -915,17 +1143,18 @@ def run(
         click.echo("Error: --objective or --trace-id is required.", err=True)
         sys.exit(1)
 
-    status = runner.get_status(handle)
+    if config.runtime.mode != "interactive":
+        status = runner.get_status(handle)
 
-    # For resume runs, if state is RUNNING and we are not in supervised
-    # clarification flow, resume immediately.
-    if resume_trace_id and status.state == "RUNNING" and config.runtime.mode != "supervised":
-        try:
-            handle = runner.resume_run(handle.trace_id)
-            status = runner.get_status(handle)
-        except Exception as exc:
-            click.echo(f"Resume failed: {exc}", err=True)
-            sys.exit(1)
+        # For resume runs, if state is RUNNING and we are not in supervised
+        # clarification flow, resume immediately.
+        if resume_trace_id and status.state == "RUNNING" and config.runtime.mode != "supervised":
+            try:
+                handle = runner.resume_run(handle.trace_id)
+                status = runner.get_status(handle)
+            except Exception as exc:
+                click.echo(f"Resume failed: {exc}", err=True)
+                sys.exit(1)
 
     if config.runtime.mode == "supervised":
         # Supervised mode handles PAUSED clarification and then resumes.
@@ -992,7 +1221,11 @@ def status(trace_id: str, config_path: str | None) -> None:
     type=click.Choice(["continue", "pause", "revise", "replan", "stop", "escalate"]),
     help="Control command",
 )
-@click.option("--payload", default="{}", help="JSON payload")
+@click.option(
+    "--payload",
+    default="{}",
+    help="JSON payload. For stop: optional 'mode' (graceful|immediate), 'export_path' (trace file path).",
+)
 @click.option("--config", "config_path", default=None, help="Path to neuronium.toml")
 def control(
     trace_id: str,

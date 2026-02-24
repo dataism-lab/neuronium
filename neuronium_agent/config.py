@@ -42,12 +42,16 @@ class DeterminismConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
-    mode: Literal["batch", "supervised"] = "batch"
+    mode: Literal["batch", "supervised", "interactive"] = "batch"
     max_parallel_nodes: int = 4
     checkpoint_policy: Literal[
         "on_transition", "periodic", "node_boundary"
     ] = "on_transition"
     checkpoint_interval_seconds: int | None = None
+    pause_grace_period_seconds: int = 30
+    """Grace period for pause: allow active nodes to reach checkpoint (Spec §9.1.2)."""
+    stop_grace_period_seconds: int = 5
+    """Grace period for cooperative stop before forced termination (Spec §6.2.4)."""
 
 
 class StorageConfig(BaseModel):
@@ -234,6 +238,8 @@ _FLAT_ENV_MAP: dict[str, tuple[str, ...]] = {
     "NEURONIUM_QUEUE_REDIS_URL": ("queue", "redis_url"),
     "NEURONIUM_QUEUE_QUEUE_NAME": ("queue", "queue_name"),
     "NEURONIUM_RUNTIME_MODE": ("runtime", "mode"),
+    "NEURONIUM_RUNTIME_PAUSE_GRACE_PERIOD_SECONDS": ("runtime", "pause_grace_period_seconds"),
+    "NEURONIUM_RUNTIME_STOP_GRACE_PERIOD_SECONDS": ("runtime", "stop_grace_period_seconds"),
     "NEURONIUM_LLM_PROVIDER": ("llm", "provider"),
     "NEURONIUM_LLM_MODEL": ("llm", "model"),
     "NEURONIUM_LLM_BASE_URL": ("llm", "base_url"),

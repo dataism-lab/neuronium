@@ -24,6 +24,7 @@ from neuronium_agent.storage.fs_cas import FsCasStore
 from neuronium_agent.storage.sqlite_store import SqliteIndexStore
 from neuronium_agent.planning.htn import HTNPlanner
 from neuronium_agent.trace.checkpoints import (
+    MID_EXECUTE_REQUIRED_KEYS,
     PHASE_BOUNDARIES,
     CheckpointError,
     build_checkpoint_payload,
@@ -217,10 +218,115 @@ class TestCheckpointPayload:
         with pytest.raises(CheckpointError, match="agent_state"):
             load_state_from_checkpoint({"resume_context": {"phase_boundary": "final"}})
 
+    def test_paused_mid_execute_missing_required_key_raises(self, _state: AgentState) -> None:
+        """Phase 3: paused_mid_execute requires all MID_EXECUTE_REQUIRED_KEYS."""
+        base_extra = {
+            "stage_index": 0,
+            "iteration": 1,
+            "plan_id": "plan-1",
+            "runbook_id": "autofix_demo",
+            "completed_node_results": {},
+            "pending_node_ids": [],
+        }
+        # iteration is always added by build_checkpoint_payload(iteration=...); test the rest
+        keys_from_extra = MID_EXECUTE_REQUIRED_KEYS - {"iteration"}
+        for key in keys_from_extra:
+            extra = {k: v for k, v in base_extra.items() if k != key}
+            payload = build_checkpoint_payload(
+                _state,
+                iteration=1,
+                phase_boundary="paused_mid_execute",
+                extra=extra,
+            )
+            with pytest.raises(CheckpointError, match="missing required keys"):
+                load_state_from_checkpoint(payload)
+
+    def test_paused_mid_execute_completed_node_results_not_dict_raises(
+        self, _state: AgentState
+    ) -> None:
+        payload = build_checkpoint_payload(
+            _state,
+            iteration=1,
+            phase_boundary="paused_mid_execute",
+            extra={
+                "stage_index": 0,
+                "iteration": 1,
+                "plan_id": "p",
+                "runbook_id": "r",
+                "completed_node_results": "not-a-dict",
+                "pending_node_ids": [],
+            },
+        )
+        with pytest.raises(CheckpointError, match="completed_node_results.*must be a dict"):
+            load_state_from_checkpoint(payload)
+
+    def test_paused_mid_execute_pending_node_ids_not_list_raises(
+        self, _state: AgentState
+    ) -> None:
+        payload = build_checkpoint_payload(
+            _state,
+            iteration=1,
+            phase_boundary="paused_mid_execute",
+            extra={
+                "stage_index": 0,
+                "iteration": 1,
+                "plan_id": "p",
+                "runbook_id": "r",
+                "completed_node_results": {},
+                "pending_node_ids": "not-a-list",
+            },
+        )
+        with pytest.raises(CheckpointError, match="pending_node_ids.*must be a list"):
+            load_state_from_checkpoint(payload)
+
+    def test_paused_mid_execute_valid_restores_all_context(self, _state: AgentState) -> None:
+        """Phase 3: valid paused_mid_execute checkpoint restores full resume_context."""
+        extra = {
+            "stage_index": 1,
+            "iteration": 2,
+            "plan_id": "plan-42",
+            "runbook_id": "autofix_demo",
+            "completed_node_results": {
+                "n1": {"outputs": {"x": 1}, "status": "COMPLETED", "quality_signals": {}},
+            },
+            "pending_node_ids": ["n2", "n3"],
+            "metadata": {"key": "value"},
+            "planned_graph": {"metadata": {"plan_id": "plan-42"}, "nodes": [], "edges": []},
+        }
+        payload = build_checkpoint_payload(
+            _state,
+            iteration=2,
+            phase_boundary="paused_mid_execute",
+            extra=extra,
+        )
+        state, ctx = load_state_from_checkpoint(payload)
+        assert ctx["phase_boundary"] == "paused_mid_execute"
+        assert ctx["stage_index"] == 1
+        assert ctx["iteration"] == 2
+        assert ctx["plan_id"] == "plan-42"
+        assert ctx["runbook_id"] == "autofix_demo"
+        assert ctx["completed_node_results"] == extra["completed_node_results"]
+        assert ctx["pending_node_ids"] == ["n2", "n3"]
+        assert ctx["metadata"] == {"key": "value"}
+        assert ctx["planned_graph"] == extra["planned_graph"]
+
     def test_all_phase_boundaries_accepted(self, _state: AgentState) -> None:
         for boundary in PHASE_BOUNDARIES:
+            extra: dict | None = None
+            if boundary == "paused_mid_execute":
+                extra = {
+                    "stage_index": 0,
+                    "iteration": 1,
+                    "plan_id": "plan-1",
+                    "runbook_id": "autofix_demo",
+                    "completed_node_results": {"n1": {"outputs": {}, "status": "COMPLETED"}},
+                    "pending_node_ids": ["n2"],
+                }
             payload = build_checkpoint_payload(
-                _state, iteration=1, phase_boundary=boundary,
+                _state,
+                iteration=1,
+                phase_boundary=boundary,
+                extra=extra,
             )
             state, ctx = load_state_from_checkpoint(payload)
             assert ctx["phase_boundary"] == boundary

@@ -27,6 +27,8 @@ class TestAppConfigDefaults:
         assert cfg.determinism.default_random_seed == 0
         assert cfg.determinism.strict is False
         assert cfg.determinism.mcp_allow_non_deterministic_tool_ids == []
+        assert cfg.runtime.pause_grace_period_seconds == 30
+        assert cfg.runtime.stop_grace_period_seconds == 5
         assert cfg.code_node.docker.network_enabled is False
         assert cfg.memory.semantic_search.enabled is False
         assert cfg.model_catalog is None
@@ -113,3 +115,20 @@ description = "Larger model for complex tasks"
         assert by_id["default"].model == "gpt-4.1-mini"
         assert by_id["gpt4"].model == "gpt-4.1"
         assert by_id["gpt4"].description == "Larger model for complex tasks"
+
+    def test_runtime_grace_periods_from_load_config(self, tmp_path: Path) -> None:
+        """load_config() exposes pause/stop grace period; defaults and TOML override."""
+        cfg = load_config(config_path="nonexistent.toml")
+        assert cfg.runtime.pause_grace_period_seconds == 30
+        assert cfg.runtime.stop_grace_period_seconds == 5
+
+        toml_content = """
+[runtime]
+pause_grace_period_seconds = 60
+stop_grace_period_seconds = 10
+"""
+        toml_file = tmp_path / "neuronium.toml"
+        toml_file.write_text(toml_content, encoding="utf-8")
+        cfg = load_config(config_path=str(toml_file))
+        assert cfg.runtime.pause_grace_period_seconds == 60
+        assert cfg.runtime.stop_grace_period_seconds == 10

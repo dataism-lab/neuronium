@@ -417,8 +417,8 @@ class HtnRecursivePlannerBackend:
         return (
             "Extract a structured envelope for planning.\n"
             "Use candidates as hints and fill missing_fields for critical gaps.\n"
-            "For file tasks, set intent.task_type='write_file' and provide inputs.output_filename "
-            "and inputs.output_text.\n"
+            "For file tasks, set intent.task_type='write_file' and fill output_filename "
+            "and output_text inside the inputs object.\n"
             "For optional slots that are unknown, use JSON null.\n"
             "Never return placeholder strings like 'None', 'null', 'n/a', or empty wrappers.\n"
             "If you set inputs.output_filename, it must be a bare filename with extension "
@@ -522,7 +522,9 @@ class HtnRecursivePlannerBackend:
         execute_graph: ExecutePlannerGraphFn,
     ) -> tuple[dict[str, Any], list[MissingField]]:
         metadata = dict(request.metadata)
-        metadata.update(dict(extraction.envelope.inputs))
+        for k, v in extraction.envelope.inputs.items():
+            if v is not None or k not in metadata:
+                metadata[k] = v
 
         urls = metadata.get("urls")
         if not isinstance(urls, list):
@@ -659,22 +661,24 @@ class HtnRecursivePlannerBackend:
 
         missing: list[MissingField] = []
         for mf in envelope.missing_fields:
-            if mf.field == "url" and urls:
+            key = mf.field.removeprefix("inputs.") if mf.field.startswith("inputs.") else mf.field
+            if key == "url" and urls:
                 continue
-            if mf.field == "doc_paths" and doc_paths:
+            if key == "doc_paths" and doc_paths:
                 continue
-            if mf.field == "output_filename" and isinstance(output_filename, str) and output_filename.strip():
+            if key == "output_filename" and isinstance(output_filename, str) and output_filename.strip():
                 continue
-            if mf.field == "output_text" and isinstance(output_text, str) and output_text.strip():
+            if key == "output_text" and isinstance(output_text, str) and output_text.strip():
                 continue
-            if task_type != "write_file" and mf.field in {"output_filename", "output_text"}:
+            if task_type != "write_file" and key in {"output_filename", "output_text"}:
                 continue
-            if mf.field == "source" and (urls or doc_paths):
+            if key == "source" and (urls or doc_paths):
                 continue
-            if mf.field == "doc_paths" and urls:
+            if key == "doc_paths" and urls:
                 continue
             if mf.critical:
-                missing.append(mf)
+                normalized = MissingField(field=key, reason=mf.reason, critical=mf.critical) if key != mf.field else mf
+                missing.append(normalized)
 
         if unresolved_doc_paths and not urls:
             missing.append(MissingField(

@@ -54,9 +54,19 @@ class AgentRunner:
 
     # -- Mandatory methods (PUBLIC_API_SPEC) --------------------------------
 
-    def start(self, request: RunRequest) -> RunHandle:
-        """Start an agent run and return a handle."""
-        return self._orchestrator.start(request)
+    def start(
+        self,
+        request: RunRequest,
+        *,
+        on_handle_ready: Callable[[RunHandle], None] | None = None,
+    ) -> RunHandle:
+        """Start an agent run and return a handle.
+
+        If on_handle_ready is provided (e.g. for interactive CLI), it is
+        called with the handle before execution blocks, so the caller can
+        send control commands during the run.
+        """
+        return self._orchestrator.start(request, on_handle_ready=on_handle_ready)
 
     def get_status(self, handle: RunHandle) -> RunStatus:
         """Get current status of a run."""

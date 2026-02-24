@@ -5,6 +5,7 @@ __version__ = "0.1.0"
 # Public re-exports (lazy, to avoid heavy imports at package level)
 from neuronium_agent.types import (
     ControlCommand,
+    InterruptRequest,
     RunHandle,
     RunRequest,
     RunStatus,
@@ -26,6 +27,7 @@ __all__ = [
     "RunHandle",
     "RunStatus",
     "ControlCommand",
+    "InterruptRequest",
     "TraceExportFormat",
     # Errors
     "NeuroniumError",
