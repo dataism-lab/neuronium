@@ -164,3 +164,43 @@
 ### Handoff note
 - Next step: expand dynamic schema integration from extraction prompt/schema into downstream validation path (phase 2 acceptance hardening).
 - Before phase 3, re-check `ToolSchemaRegistry` placement trigger if a second non-planning consumer appears in runtime paths.
+
+## 2026-02-24 — Phase 2 hardening completion (tool-agnostic)
+
+### Plan
+- Complete phase-2 hardening only: keep patch/revise (phase 3) untouched.
+- Extend dynamic extraction schema usage from extraction to downstream missing-field validation.
+- Preserve legacy behavior when dynamic flag is disabled.
+
+### Decisions
+- `HtnRecursivePlannerBackend` now carries `extraction_input_schema` from extraction stage artifacts into validation path.
+- `_compute_missing_fields(...)` now supports dual-path behavior:
+  - dynamic path (only when dynamic input schema exists): compute missing via `compute_missing_slots(...)` and map to legacy `MissingField.field` using `slot_path_to_legacy_field(...)`;
+  - legacy path (flag off / no dynamic schema): keep previous task-type-driven logic unchanged.
+- Dynamic validation keeps backward compatibility for clarification contract shape (`missing_fields`), while avoiding new per-tool `if/elif`.
+- Added tests for:
+  - dynamic validation activation and required-field propagation to missing list,
+  - legacy fallback behavior unchanged,
+  - new catalog tool reflection in extraction schema and missing fields without backend branching.
+
+### Verification
+- Ran targeted unit+integration suite:
+  - `uv run pytest tests/test_phase2_dynamic_extraction_schema.py tests/test_planner_backend_contract.py tests/test_htn_recursive_backend_integration.py tests/test_phase1_legacy_compat_smoke.py tests/test_supervised_clarification_flow.py -q`
+- Result:
+  - `19 passed in 0.53s`
+- Lint check on edited files:
+  - `neuronium_agent/planning/htn_recursive_backend.py`
+  - `tests/test_phase2_dynamic_extraction_schema.py`
+  - `tests/test_planner_backend_contract.py`
+  - Result: no linter errors reported.
+
+### Outcome
+- Phase-2 acceptance hardening is implemented:
+  1. dynamic extraction schema is now used in both extraction and validation (under existing runbook/stage feature-flag gating),
+  2. legacy mode remains operational when flag is off,
+  3. new catalog tools propagate into extraction schema and missing slots without new tool-specific branches,
+  4. unit+integration tests are green.
+
+### Handoff note
+- Keep current dynamic required-field merge strategy (union across allowed tools) for phase 2; review strictness before wider rollout.
+- Phase 3 should only address patch/revise integration and should not rework phase-2 compatibility bridge unless regression evidence appears.
