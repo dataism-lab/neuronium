@@ -32,6 +32,10 @@ from neuronium_agent.planning.planner_contract import (
     PlannerRequest,
     PlannerResult,
 )
+from neuronium_agent.planning.missing_slots import (
+    compute_missing_slots,
+    slot_path_to_legacy_field,
+)
 from neuronium_agent.planning.tool_schema_registry import ToolSchemaRegistry
 from neuronium_agent.verification.business_critic import (
     BUSINESS_CRITIC_SYSTEM_PROMPT,
@@ -64,6 +68,7 @@ class _ExtractionArtifacts:
     candidate_urls: list[str]
     candidate_paths: list[str]
     candidate_basenames: list[str]
+    extraction_input_schema: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -410,6 +415,7 @@ class HtnRecursivePlannerBackend:
             candidate_urls=candidate_urls,
             candidate_paths=candidate_paths,
             candidate_basenames=candidate_basenames,
+            extraction_input_schema=extraction_input_schema,
         )
 
     @staticmethod
@@ -657,6 +663,7 @@ class HtnRecursivePlannerBackend:
             request=request,
             envelope=extraction.envelope,
             metadata=metadata,
+            dynamic_input_schema=extraction.extraction_input_schema,
         )
         return metadata, missing_fields
 
@@ -718,7 +725,15 @@ class HtnRecursivePlannerBackend:
         request: PlannerRequest,
         envelope: ExtractionEnvelope,
         metadata: dict[str, Any],
+        dynamic_input_schema: dict[str, Any] | None = None,
     ) -> list[MissingField]:
+        if dynamic_input_schema is not None:
+            return self._compute_schema_missing_fields(
+                envelope=envelope,
+                metadata=metadata,
+                input_schema=dynamic_input_schema,
+            )
+
         task_type = self._effective_task_type(
             requested_task_type=envelope.intent.task_type or "generic_task",
             metadata=metadata,
@@ -803,6 +818,45 @@ class HtnRecursivePlannerBackend:
             missing = [m for m in missing if m.field != "source"]
 
         # Stable dedupe by field+reason
+        dedup: dict[tuple[str, str], MissingField] = {}
+        for mf in missing:
+            dedup[(mf.field, mf.reason)] = mf
+        return [dedup[k] for k in sorted(dedup)]
+
+    @staticmethod
+    def _compute_schema_missing_fields(
+        *,
+        envelope: ExtractionEnvelope,
+        metadata: dict[str, Any],
+        input_schema: dict[str, Any],
+    ) -> list[MissingField]:
+        missing: list[MissingField] = []
+        schema_slots = compute_missing_slots(
+            state=metadata,
+            input_schema=input_schema,
+        )
+        for slot in schema_slots:
+            missing.append(MissingField(
+                field=slot_path_to_legacy_field(slot.path),
+                reason=slot.reason,
+                critical=slot.critical,
+            ))
+
+        # Keep critical model-signaled gaps that belong to current dynamic schema.
+        schema_properties = input_schema.get("properties", {})
+        allowed_keys = (
+            {str(k) for k in schema_properties.keys()}
+            if isinstance(schema_properties, dict)
+            else set()
+        )
+        for mf in envelope.missing_fields:
+            key = mf.field.removeprefix("inputs.") if mf.field.startswith("inputs.") else mf.field
+            if not mf.critical:
+                continue
+            if key not in allowed_keys:
+                continue
+            missing.append(MissingField(field=key, reason=mf.reason, critical=True))
+
         dedup: dict[tuple[str, str], MissingField] = {}
         for mf in missing:
             dedup[(mf.field, mf.reason)] = mf
