@@ -99,3 +99,49 @@ def test_cli_prompt_helpers_include_examples_and_groups() -> None:
     })
     assert "Пример:" in prompt
     assert "https://example.com/news" in prompt
+
+
+def test_cli_schema_parser_supports_array_and_boolean() -> None:
+    parsed_array = cli_main._parse_answer_by_question_schema(
+        "a, b, c",
+        {"key": "tags", "expected_schema": {"type": "array", "items": {"type": "string"}}},
+    )
+    assert parsed_array == ["a", "b", "c"]
+
+    parsed_bool = cli_main._parse_answer_by_question_schema(
+        "да",
+        {"key": "confirm", "expected_schema": {"type": "boolean"}},
+    )
+    assert parsed_bool is True
+
+
+def test_cli_print_pause_help_outputs_grouped_questions(capsys) -> None:
+    class _Runner:
+        @staticmethod
+        def get_latest_pause_context(_trace_id: str):
+            return {"clarification_request_artifact_id": "aid-grouped-help"}
+
+        @staticmethod
+        def read_artifact_json(_artifact_id: str):
+            return {
+                "questions": [
+                    {
+                        "key": "recipient_name",
+                        "path": "/inputs/recipient_name",
+                        "prompt": "Укажи получателя",
+                        "examples": ["Иван"],
+                    },
+                    {
+                        "key": "path",
+                        "path": "/tool_args/path",
+                        "prompt": "Укажи путь",
+                        "examples": ["reports/out.md"],
+                    },
+                ]
+            }
+
+    cli_main._print_pause_help(_Runner(), "trace-1")
+    out = capsys.readouterr().out
+    assert "- Группа: inputs" in out
+    assert "- Группа: tool_args" in out
+    assert "Пример:" in out

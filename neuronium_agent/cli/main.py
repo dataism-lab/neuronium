@@ -53,6 +53,58 @@ def _question_prompt_with_examples(question: dict[str, Any]) -> str:
     return f"{base} Пример: {normalized_examples[0]}"
 
 
+def _schema_allows_type(schema: dict[str, Any], expected: str) -> bool:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str):
+        return schema_type == expected
+    if isinstance(schema_type, list):
+        return expected in schema_type
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            if isinstance(variant, dict) and _schema_allows_type(variant, expected):
+                return True
+    return False
+
+
+def _parse_answer_by_question_schema(raw_answer: str, question: dict[str, Any]) -> object:
+    value = raw_answer.strip()
+    schema = question.get("expected_schema")
+    if not isinstance(schema, dict):
+        schema = {}
+
+    if _schema_allows_type(schema, "array"):
+        return [part.strip() for part in value.split(",") if part.strip()]
+
+    if _schema_allows_type(schema, "boolean"):
+        lowered = value.lower()
+        if lowered in {"true", "1", "yes", "y", "да"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "нет"}:
+            return False
+
+    if _schema_allows_type(schema, "integer"):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+
+    if _schema_allows_type(schema, "number"):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+    # Backward-compatible fallback for legacy questions without schema.
+    key = str(question.get("key", "")).strip()
+    if key in {"doc_paths", "paths", "urls"}:
+        return [part.strip() for part in value.split(",") if part.strip()]
+
+    return value
+
+
 def _setup_logging(level: str = "INFO", json_logs: bool = True) -> None:
     fmt = (
         '{"ts":"%(asctime)s","level":"%(levelname)s","name":"%(name)s","msg":"%(message)s"}'
@@ -118,12 +170,7 @@ def _interactive_supervised_loop(
                     click.echo(f"[{group}]")
                 prompt = _question_prompt_with_examples(q)
                 answer = click.prompt(prompt, default="", show_default=False).strip()
-                if key in {"doc_paths", "paths"}:
-                    answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
-                elif key == "urls":
-                    answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
-                else:
-                    answers[key] = answer
+                answers[key] = _parse_answer_by_question_schema(answer, q)
             payload = {
                 "clarification_request_artifact_id": request_artifact_id,
                 "answers": answers,
