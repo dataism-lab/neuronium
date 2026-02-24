@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 from pydantic import BaseModel, Field
 
-from neuronium_agent.planning.tool_schema_registry import (
+from neuronium_agent.schemas.tool_schema_registry import (
     extract_required_json_pointers,
     schema_fragment_at_pointer,
 )
