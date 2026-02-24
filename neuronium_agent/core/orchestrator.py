@@ -50,6 +50,7 @@ from neuronium_agent.planning.dynamic_planner import validate_planned_graph
 from neuronium_agent.planning.htn import HTNPlanner
 from neuronium_agent.planning.operator_catalog import OperatorCatalog
 from neuronium_agent.planning.planner_backend import get_planner_backend
+from neuronium_agent.planning.state_patch import PatchOperation, StatePatchError, apply_patch
 from neuronium_agent.planning.planner_contract import (
     DynamicPlannerSpec,
     PlannerEscalation,
@@ -426,6 +427,9 @@ class Orchestrator:
             answers = payload.get("answers", {})
             if not isinstance(answers, dict):
                 answers = {}
+            patch_ops = self._normalise_patch_ops(payload.get("patch"))
+            if not patch_ops and answers:
+                patch_ops = self._legacy_answers_to_patch(answers)
             answer_text = payload.get("answer_text")
             if not isinstance(answer_text, str):
                 answer_text = None
@@ -434,7 +438,8 @@ class Orchestrator:
             ).strip()
 
             decision_payload = dict(payload)
-            if answers or answer_text:
+            decision_payload["patch"] = patch_ops
+            if answers or answer_text or patch_ops:
                 plan_id = (
                     state.intention.plan_id
                     if state.intention and state.intention.plan_id
@@ -442,9 +447,11 @@ class Orchestrator:
                 )
                 response_payload = {
                     "request_artifact_id": request_artifact_id,
-                    "answers": answers,
+                    "patch": patch_ops,
                     "answer_text": answer_text,
                 }
+                if answers:
+                    response_payload["legacy_answers"] = answers
                 response_artifact_id = self._persist_control_artifact(
                     artifact_type="planner.clarification_response",
                     payload=response_payload,
@@ -1512,40 +1519,19 @@ class Orchestrator:
                     if resp_aid:
                         metadata["clarification_response_artifact_id"] = resp_aid
 
-                    answers = control_payload.get("answers", {})
-                    if isinstance(answers, dict):
-                        if isinstance(answers.get("url"), str) and answers["url"].strip():
-                            metadata["url"] = answers["url"].strip()
-                            metadata["urls"] = [answers["url"].strip()]
-                        raw_urls = answers.get("urls")
-                        if isinstance(raw_urls, list):
-                            urls = [str(x).strip() for x in raw_urls if str(x).strip()]
-                            if urls:
-                                metadata["urls"] = urls
-                                metadata["url"] = urls[0]
-                        raw_doc_paths = answers.get("doc_paths")
-                        if isinstance(raw_doc_paths, list):
-                            doc_paths = [str(x).strip() for x in raw_doc_paths if str(x).strip()]
-                            if doc_paths:
-                                metadata["doc_paths"] = doc_paths
-                        elif isinstance(raw_doc_paths, str) and raw_doc_paths.strip():
-                            parts = [p.strip() for p in raw_doc_paths.split(",") if p.strip()]
-                            if parts:
-                                metadata["doc_paths"] = parts
-
-                        out_fn = answers.get("output_filename")
-                        if isinstance(out_fn, str) and out_fn.strip():
-                            metadata["output_filename"] = out_fn.strip()
-                        out_text = answers.get("output_text")
-                        if isinstance(out_text, str) and out_text.strip():
-                            metadata["output_text"] = out_text.strip()
-                        for ans_key, ans_val in answers.items():
-                            if ans_key in metadata:
-                                continue
-                            if isinstance(ans_val, str) and ans_val.strip():
-                                metadata[ans_key] = ans_val.strip()
-                            elif isinstance(ans_val, list) and ans_val:
-                                metadata[ans_key] = ans_val
+                    patch_ops = self._normalise_patch_ops(control_payload.get("patch"))
+                    if not patch_ops:
+                        answers = control_payload.get("answers", {})
+                        if isinstance(answers, dict):
+                            patch_ops = self._legacy_answers_to_patch(answers)
+                    if patch_ops:
+                        try:
+                            metadata = apply_patch(metadata, patch_ops)
+                        except StatePatchError as exc:
+                            logger.warning(
+                                "Skipping invalid revise patch during metadata inference: %s",
+                                exc,
+                            )
             # Pick up doc_paths for docs_report_v1
             if (
                 payload.get("runbook_id") == runbook_id
@@ -1560,6 +1546,72 @@ class Orchestrator:
                 metadata["doc_paths"] = [str(p) for p in payload["doc_paths"]]
                 continue
         return metadata
+
+    @staticmethod
+    def _normalise_patch_ops(raw_patch: Any) -> list[dict[str, Any]]:
+        """Validate and canonicalize patch operations for revise payload."""
+        if not isinstance(raw_patch, list):
+            return []
+        normalized: list[dict[str, Any]] = []
+        for raw_op in raw_patch:
+            try:
+                op = (
+                    raw_op
+                    if isinstance(raw_op, PatchOperation)
+                    else PatchOperation.model_validate(raw_op)
+                )
+            except Exception:
+                continue
+            entry: dict[str, Any] = {"op": op.op, "path": op.path}
+            if op.op in {"add", "replace"}:
+                entry["value"] = op.value
+            normalized.append(entry)
+        return normalized
+
+    @classmethod
+    def _legacy_answers_to_patch(cls, answers: dict[str, Any]) -> list[dict[str, Any]]:
+        """Bridge legacy answers payload to patch operations."""
+        patch: list[dict[str, Any]] = []
+        for raw_key, raw_value in answers.items():
+            if not isinstance(raw_key, str):
+                continue
+            key = raw_key.strip()
+            if not key:
+                continue
+            value = cls._normalize_legacy_answer_value(key, raw_value)
+            if value is None:
+                continue
+            escaped_key = cls._pointer_escape_token(key)
+            patch.append({"op": "add", "path": f"/{escaped_key}", "value": value})
+            # Keep compatibility for consumers that read both url and urls.
+            if key == "url" and isinstance(value, str):
+                patch.append({"op": "add", "path": "/urls", "value": [value]})
+        return patch
+
+    @staticmethod
+    def _normalize_legacy_answer_value(key: str, raw_value: Any) -> Any:
+        if key == "doc_paths" and isinstance(raw_value, str):
+            parts = [p.strip() for p in raw_value.split(",") if p.strip()]
+            return parts or None
+        if isinstance(raw_value, str):
+            value = raw_value.strip()
+            return value or None
+        if isinstance(raw_value, list):
+            normalized: list[Any] = []
+            for item in raw_value:
+                if isinstance(item, str):
+                    text = item.strip()
+                    if text:
+                        normalized.append(text)
+                    continue
+                if item is not None:
+                    normalized.append(item)
+            return normalized or None
+        return raw_value
+
+    @staticmethod
+    def _pointer_escape_token(token: str) -> str:
+        return token.replace("~", "~0").replace("/", "~1")
 
     # -- Runbook gate helpers -----------------------------------------------
 

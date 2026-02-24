@@ -192,10 +192,19 @@ def test_supervised_clarification_pause_revise_resume_flow(
     ]
     assert revise_events
     control_payload = revise_events[-1]["payload"]["payload"]
+    patch_ops = control_payload.get("patch")
+    assert isinstance(patch_ops, list)
+    assert patch_ops
+    assert any(op.get("path") == "/url" for op in patch_ops if isinstance(op, dict))
     response_artifact_id = str(
         control_payload.get("clarification_response_artifact_id", "")
     ).strip()
     assert response_artifact_id
+
+    clarification_response = runner.read_artifact_json(response_artifact_id)
+    assert isinstance(clarification_response.get("patch"), list)
+    assert clarification_response["patch"]
+    assert clarification_response.get("legacy_answers") == {"url": "https://example.com/news/1"}
 
     rows = runner._index._fetchall(  # type: ignore[attr-defined]
         "SELECT parent_artifact_id, child_artifact_id, kind FROM lineage_edges WHERE child_artifact_id=?",
@@ -233,3 +242,52 @@ def test_replay_preserves_paused_clarification_context(
         replay_pause.get("clarification_request_artifact_id", "")
     ).strip()
     assert replay_aid == original_aid
+
+
+def test_supervised_clarification_revise_patch_payload(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(tmp_dir, monkeypatch)
+
+    handle = runner.start(RunRequest(
+        objective="Сделай сводку новости",
+        mode="supervised",
+        metadata={"runbook_id": "super_agent_v0"},
+    ))
+    assert runner.get_status(handle).state == "PAUSED"
+    pause_context = runner.get_latest_pause_context(handle.trace_id)
+    assert pause_context is not None
+    request_artifact_id = str(
+        pause_context.get("clarification_request_artifact_id", "")
+    ).strip()
+    assert request_artifact_id
+
+    patch_ops = [
+        {"op": "add", "path": "/url", "value": "https://example.com/news/1"},
+        {"op": "add", "path": "/urls", "value": ["https://example.com/news/1"]},
+    ]
+    revise_status = runner.control(
+        handle,
+        ControlCommand(
+            type="revise",
+            payload={
+                "clarification_request_artifact_id": request_artifact_id,
+                "patch": patch_ops,
+            },
+        ),
+    )
+    assert revise_status.state == "PAUSED"
+    assert runner.control(handle, ControlCommand(type="continue", payload={})).state == "RUNNING"
+    final_status = runner.get_status(runner.resume_run(handle.trace_id))
+    assert final_status.state == "COMPLETED"
+
+    events = list(runner._index.get_trace_events(handle.trace_id))
+    revise_events = [
+        e for e in events
+        if e["kind"] == "decision"
+        and e.get("payload", {}).get("description") == "control_command: revise"
+    ]
+    assert revise_events
+    control_payload = revise_events[-1]["payload"]["payload"]
+    assert control_payload.get("patch") == patch_ops

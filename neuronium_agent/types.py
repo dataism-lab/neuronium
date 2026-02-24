@@ -44,6 +44,8 @@ class ControlCommand(BaseModel):
     """User control command (Control Protocol §11)."""
 
     type: Literal["continue", "pause", "revise", "replan", "stop", "escalate"]
+    # revise payload (phase 3): prefers `patch` (RFC6902 subset ops),
+    # keeps legacy `answers` temporarily for backward compatibility bridge.
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
