@@ -68,26 +68,36 @@ def _interactive_supervised_loop(
 
         click.echo("Run paused: требуется уточнение входных параметров.")
 
-        answers: dict[str, object] = {}
-        for q in questions:
-            if not isinstance(q, dict):
-                continue
-            key = str(q.get("key", "")).strip()
-            if not key or key in answers:
-                continue
-            prompt = str(q.get("prompt", key)).strip() or key
-            answer = click.prompt(prompt, default="", show_default=False).strip()
-            if key in {"doc_paths", "paths"}:
-                answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
-            elif key == "urls":
-                answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
-            else:
-                answers[key] = answer
-
-        payload = {
-            "clarification_request_artifact_id": request_artifact_id,
-            "answers": answers,
-        }
+        answer_text = click.prompt(
+            "Общий ответ (можно одним сообщением; Enter — перейти к вопросам)",
+            default="",
+            show_default=False,
+        ).strip()
+        if answer_text:
+            payload = {
+                "clarification_request_artifact_id": request_artifact_id,
+                "answer_text": answer_text,
+            }
+        else:
+            answers: dict[str, object] = {}
+            for q in questions:
+                if not isinstance(q, dict):
+                    continue
+                key = str(q.get("key", "")).strip()
+                if not key or key in answers:
+                    continue
+                prompt = str(q.get("prompt", key)).strip() or key
+                answer = click.prompt(prompt, default="", show_default=False).strip()
+                if key in {"doc_paths", "paths"}:
+                    answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
+                elif key == "urls":
+                    answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
+                else:
+                    answers[key] = answer
+            payload = {
+                "clarification_request_artifact_id": request_artifact_id,
+                "answers": answers,
+            }
         runner.control(handle, ControlCommand(type="revise", payload=payload))  # type: ignore[arg-type]
         handle = runner.resume_run(handle.trace_id)
         status = runner.get_status(handle)

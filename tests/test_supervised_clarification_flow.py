@@ -32,6 +32,26 @@ _REPLAY_MAP: dict[str, list[dict]] = {
             "status": "COMPLETED",
         },
     ],
+    "control_nl_to_patch": [
+        {
+            "outputs": {
+                "content": json.dumps({
+                    "patch": [
+                        {
+                            "op": "add",
+                            "path": "/url",
+                            "value": "https://example.com/news/1",
+                        },
+                    ],
+                    "needs_clarification": False,
+                    "confidence": 0.93,
+                    "rationale": "URL extracted from user clarification text.",
+                }),
+            },
+            "quality_signals": {"tokens_used": 7},
+            "status": "COMPLETED",
+        }
+    ],
     "super_method_select_extract_envelope": [
         # 1st call: before clarification — missing url so planner escalates
         {
@@ -291,3 +311,63 @@ def test_supervised_clarification_revise_patch_payload(
     assert revise_events
     control_payload = revise_events[-1]["payload"]["payload"]
     assert control_payload.get("patch") == patch_ops
+
+
+def test_supervised_clarification_revise_answer_text_to_patch(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(tmp_dir, monkeypatch)
+
+    handle = runner.start(RunRequest(
+        objective="Сделай сводку новости",
+        mode="supervised",
+        metadata={"runbook_id": "super_agent_v0"},
+    ))
+    assert runner.get_status(handle).state == "PAUSED"
+    pause_context = runner.get_latest_pause_context(handle.trace_id)
+    assert pause_context is not None
+    request_artifact_id = str(
+        pause_context.get("clarification_request_artifact_id", "")
+    ).strip()
+    assert request_artifact_id
+
+    revise_status = runner.control(
+        handle,
+        ControlCommand(
+            type="revise",
+            payload={
+                "clarification_request_artifact_id": request_artifact_id,
+                "answer_text": "Возьми URL: https://example.com/news/1",
+            },
+        ),
+    )
+    assert revise_status.state == "PAUSED"
+    assert runner.control(handle, ControlCommand(type="continue", payload={})).state == "RUNNING"
+    final_status = runner.get_status(runner.resume_run(handle.trace_id))
+    assert final_status.state == "COMPLETED"
+
+    events = list(runner._index.get_trace_events(handle.trace_id))
+    revise_events = [
+        e for e in events
+        if e["kind"] == "decision"
+        and e.get("payload", {}).get("description") == "control_command: revise"
+    ]
+    assert revise_events
+    control_payload = revise_events[-1]["payload"]["payload"]
+    patch_ops = control_payload.get("patch")
+    assert isinstance(patch_ops, list)
+    assert any(op.get("path") == "/url" for op in patch_ops if isinstance(op, dict))
+    conversion = control_payload.get("nl_patch_conversion")
+    assert isinstance(conversion, dict)
+    assert conversion.get("status") == "ok"
+
+    response_artifact_id = str(
+        control_payload.get("clarification_response_artifact_id", "")
+    ).strip()
+    assert response_artifact_id
+    clarification_response = runner.read_artifact_json(response_artifact_id)
+    assert clarification_response.get("answer_text") == "Возьми URL: https://example.com/news/1"
+    assert isinstance(clarification_response.get("patch"), list)
+    assert clarification_response["patch"]
+    assert isinstance(clarification_response.get("nl_patch_conversion"), dict)

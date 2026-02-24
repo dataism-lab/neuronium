@@ -349,3 +349,51 @@
 ### Handoff note
 - Next phase should focus on NL feedback to `StatePatch` (phase 5) without reintroducing field-specific merge rules.
 - If stricter schema inference is needed, evolve `_build_runtime_input_schema(...)` incrementally and guard changes with regression tests first.
+
+## 2026-02-24 — Phase 5 implementation: NL feedback -> StatePatch (IBS-driven)
+
+### Plan
+- Implement NL clarification answer to patch conversion in control/orchestrator path per IBS `§9.2` and `§11.2`.
+- Keep backward compatibility (`answers -> patch` bridge and existing CLI question flow).
+- Prove behavior with targeted clarification tests and regression suite.
+
+### Decisions
+- Clarification contracts expanded with patch-oriented hints:
+  - `ClarificationQuestion.path`
+  - `ClarificationQuestion.expected_schema`
+- Planner clarification question generation now carries structural hints:
+  - fallback path computes pointer + expected schema from field key,
+  - model-generated questions accept optional `path`/`expected_schema` and are normalized deterministically.
+- `Orchestrator.apply_control(revise)` now supports NL path:
+  - if `payload.patch` absent and `payload.answers` absent but `payload.answer_text` present,
+  - run model-step conversion (`control_nl_to_patch`) with strict JSON schema output,
+  - apply confidence/clarification gate (`needs_clarification` or low confidence => no patch),
+  - persist conversion result in decision payload and clarification response artifact.
+- CLI supervised clarification loop now supports single free-form answer first (`answer_text`), with fallback to legacy per-question answers when left empty.
+- Compatibility preserved:
+  - legacy `answers` remains supported and bridged to patch,
+  - existing clarify/revise flow remains operational.
+
+### Verification
+- Updated tests:
+  - `tests/test_supervised_clarification_flow.py`
+    - added `answer_text -> patch` revise integration scenario.
+- Ran targeted tests:
+  - `uv run pytest tests/test_supervised_clarification_flow.py tests/test_cli_bug5_pause_flow.py -q`
+  - Result: `7 passed in 0.72s`
+- Ran regression tests:
+  - `uv run pytest tests/test_state_patch.py tests/test_phase2_dynamic_extraction_schema.py tests/test_planner_backend_contract.py tests/test_htn_recursive_backend_integration.py -q`
+  - Result: `23 passed in 0.25s`
+- Lint check:
+  - no linter errors in edited files.
+
+### Outcome
+- Phase 5 core behavior is implemented:
+  - NL clarification feedback can be converted into patch operations,
+  - patch conversion is schema-constrained and confidence-gated,
+  - trace/replay now includes model conversion step and conversion outcome metadata.
+- Existing answers-based compatibility path remains intact.
+
+### Handoff note
+- Next hardening step: add explicit negative-path tests for low-confidence/needs-clarification conversion outcomes across more runbooks.
+- Before removing legacy `answers` bridge, run compatibility window and migration metrics for clients still sending `answers`.
