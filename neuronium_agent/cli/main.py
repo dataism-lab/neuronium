@@ -49,8 +49,6 @@ def _interactive_supervised_loop(
     """Handle PAUSED clarification flow in supervised mode."""
     status = runner.get_status(handle)
     while status.state == "PAUSED":
-        # Ensure DB state is RUNNING before resume_run (resume requires it).
-        runner.control(handle, ControlCommand(type="continue", payload={}))  # type: ignore[arg-type]
         pause_context = runner.get_latest_pause_context(handle.trace_id)
         if not pause_context:
             break
@@ -58,7 +56,10 @@ def _interactive_supervised_loop(
             pause_context.get("clarification_request_artifact_id", "")
         ).strip()
         if not request_artifact_id:
+            # Not a clarification pause: leave control to caller/UI.
             break
+        # Clarification path: resume first, then collect and apply revise payload.
+        runner.control(handle, ControlCommand(type="continue", payload={}))  # type: ignore[arg-type]
 
         clarification = runner.read_artifact_json(request_artifact_id)
         questions = clarification.get("questions", [])
@@ -302,6 +303,7 @@ def _interactive_run_loop(
         )
         if has_clarification:
             handle, status = _interactive_supervised_loop(runner, handle)
+            status = runner.get_status(handle)
             continue
         click.echo("PAUSED. Press Enter to continue, q to stop.")
         if not sys.stdin.isatty():

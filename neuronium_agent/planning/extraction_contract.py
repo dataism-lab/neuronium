@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -59,12 +60,84 @@ class ClarificationResponse(BaseModel):
     answer_text: str | None = None
 
 
-def extraction_envelope_json_schema() -> dict[str, Any]:
+def extraction_envelope_json_schema(
+    *,
+    input_schema: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return an OpenAI-compatible JSON Schema without $ref/$defs.
 
     Pydantic's `model_json_schema()` uses `$defs/$ref`, which can trigger
     `400 Bad Request` for `response_format=json_schema` on some OpenAI models.
     """
+    resolved_inputs_schema: dict[str, Any]
+    missing_field_enum: list[str] | None
+    if input_schema is None:
+        resolved_inputs_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": [
+                "url",
+                "urls",
+                "doc_paths",
+                "language",
+                "output_format",
+                "summary_length",
+                "output_filename",
+                "output_text",
+            ],
+            "properties": {
+                "url": {"type": ["string", "null"]},
+                "urls": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "doc_paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                },
+                "language": {"type": ["string", "null"]},
+                "output_format": {"type": ["string", "null"]},
+                "summary_length": {"type": ["string", "null"]},
+                "output_filename": {
+                    "type": ["string", "null"],
+                    # Bare filename only (no path), e.g. "summary.html"
+                    "pattern": "^(?![Nn]one$)(?![Nn][Uu][Ll][Ll]$)[A-Za-z0-9_.-]{1,128}$",
+                },
+                "output_text": {"type": ["string", "null"]},
+            },
+        }
+        missing_field_enum = [
+            "url",
+            "urls",
+            "doc_paths",
+            "language",
+            "output_format",
+            "summary_length",
+            "output_filename",
+            "output_text",
+        ]
+    else:
+        raw_required = input_schema.get("required", [])
+        required = sorted({str(x) for x in raw_required if isinstance(x, str)})
+        raw_properties = input_schema.get("properties", {})
+        properties: dict[str, Any] = {}
+        if isinstance(raw_properties, dict):
+            for key in sorted(raw_properties):
+                value = raw_properties[key]
+                if isinstance(value, dict):
+                    properties[key] = deepcopy(value)
+        resolved_inputs_schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "required": required,
+            "properties": properties,
+        }
+        missing_field_enum = required
+
+    missing_field_schema: dict[str, Any] = {"type": "string"}
+    if missing_field_enum:
+        missing_field_schema["enum"] = missing_field_enum
+
     return {
         "type": "object",
         "additionalProperties": False,
@@ -79,40 +152,7 @@ def extraction_envelope_json_schema() -> dict[str, Any]:
                     "confidence": {"type": "number"},
                 },
             },
-            "inputs": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": [
-                    "url",
-                    "urls",
-                    "doc_paths",
-                    "language",
-                    "output_format",
-                    "summary_length",
-                    "output_filename",
-                    "output_text",
-                ],
-                "properties": {
-                    "url": {"type": ["string", "null"]},
-                    "urls": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "doc_paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                    "language": {"type": ["string", "null"]},
-                    "output_format": {"type": ["string", "null"]},
-                    "summary_length": {"type": ["string", "null"]},
-                    "output_filename": {
-                        "type": ["string", "null"],
-                        # Bare filename only (no path), e.g. "summary.html"
-                        "pattern": "^(?![Nn]one$)(?![Nn][Uu][Ll][Ll]$)[A-Za-z0-9_.-]{1,128}$",
-                    },
-                    "output_text": {"type": ["string", "null"]},
-                },
-            },
+            "inputs": resolved_inputs_schema,
             "missing_fields": {
                 "type": "array",
                 "items": {
@@ -120,14 +160,7 @@ def extraction_envelope_json_schema() -> dict[str, Any]:
                     "additionalProperties": False,
                     "required": ["field", "reason", "critical"],
                     "properties": {
-                    "field": {
-                            "type": "string",
-                            "enum": [
-                                "url", "urls", "doc_paths", "language",
-                                "output_format", "summary_length",
-                                "output_filename", "output_text",
-                            ],
-                        },
+                        "field": missing_field_schema,
                         "reason": {"type": "string"},
                         "critical": {"type": "boolean"},
                     },

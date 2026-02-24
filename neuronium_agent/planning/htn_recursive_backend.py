@@ -32,6 +32,7 @@ from neuronium_agent.planning.planner_contract import (
     PlannerRequest,
     PlannerResult,
 )
+from neuronium_agent.planning.tool_schema_registry import ToolSchemaRegistry
 from neuronium_agent.verification.business_critic import (
     BUSINESS_CRITIC_SYSTEM_PROMPT,
     WEB_CRITIC_SYSTEM_PROMPT,
@@ -285,6 +286,10 @@ class HtnRecursivePlannerBackend:
         execute_graph: ExecutePlannerGraphFn,
         options: _BackendOptions,
     ) -> _ExtractionArtifacts:
+        extraction_input_schema: dict[str, Any] | None = None
+        if self._is_dynamic_extraction_schema_enabled(request):
+            extraction_input_schema = self._build_dynamic_extraction_input_schema(request)
+
         extraction_graph = ActionGraph(
             metadata=GraphMetadata(
                 plan_id=f"htn-extract-{request.execution_id[:12]}",
@@ -366,7 +371,9 @@ class HtnRecursivePlannerBackend:
                             "You extract planning inputs from user objective. "
                             "Return strict JSON matching schema."
                         ),
-                        "json_schema": extraction_envelope_json_schema(),
+                        "json_schema": extraction_envelope_json_schema(
+                            input_schema=extraction_input_schema
+                        ),
                     },
                 )
             ],
@@ -404,6 +411,73 @@ class HtnRecursivePlannerBackend:
             candidate_paths=candidate_paths,
             candidate_basenames=candidate_basenames,
         )
+
+    @staticmethod
+    def _flag_enabled(value: str | None) -> bool:
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _csv_set(value: str | None) -> set[str]:
+        if value is None:
+            return set()
+        return {
+            part.strip()
+            for part in str(value).split(",")
+            if part.strip()
+        }
+
+    def _is_dynamic_extraction_schema_enabled(self, request: PlannerRequest) -> bool:
+        metadata_flag = request.metadata.get("dynamic_extraction_schema")
+        if isinstance(metadata_flag, bool):
+            if not metadata_flag:
+                return False
+            allowed_runbooks = request.metadata.get("dynamic_extraction_schema_runbooks")
+            if isinstance(allowed_runbooks, list):
+                if str(request.runbook_id) not in {
+                    str(x).strip() for x in allowed_runbooks if str(x).strip()
+                }:
+                    return False
+            allowed_stages = request.metadata.get("dynamic_extraction_schema_stages")
+            if isinstance(allowed_stages, list):
+                if str(request.stage_id) not in {
+                    str(x).strip() for x in allowed_stages if str(x).strip()
+                }:
+                    return False
+            return True
+
+        env_enabled = self._flag_enabled(os.environ.get("NEURONIUM_DYNAMIC_EXTRACTION_SCHEMA"))
+        if not env_enabled:
+            return False
+        runbook_allowlist = self._csv_set(
+            os.environ.get("NEURONIUM_DYNAMIC_EXTRACTION_SCHEMA_RUNBOOKS")
+        )
+        if runbook_allowlist and request.runbook_id not in runbook_allowlist:
+            return False
+        stage_allowlist = self._csv_set(
+            os.environ.get("NEURONIUM_DYNAMIC_EXTRACTION_SCHEMA_STAGES")
+        )
+        if stage_allowlist and request.stage_id not in stage_allowlist:
+            return False
+        return True
+
+    def _build_dynamic_extraction_input_schema(
+        self,
+        request: PlannerRequest,
+    ) -> dict[str, Any] | None:
+        tool_names = [
+            str(name).strip()
+            for name in request.spec.allowed_tool_names
+            if isinstance(name, str) and str(name).strip()
+        ]
+        if not tool_names:
+            return None
+        registry = ToolSchemaRegistry.from_default_catalog()
+        available = [name for name in tool_names if name in registry.operator_catalog.by_tool_name]
+        if not available:
+            return None
+        return registry.merge_input_schemas(tool_names=available)
 
     @staticmethod
     def _build_extraction_prompt(
