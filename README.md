@@ -206,7 +206,8 @@ pytest tests/ -v
 - **Public API**: `docs/architecture/PUBLIC_API_SPEC.md`
 - **Storage schema**: `docs/architecture/STORAGE_SCHEMA_SPEC.md`
 - **Implementation Binding**: `docs/architecture/Implementation_Binding_Spec.md`
-- **Roadmap**: `docs/roadmap/ROADMAP.md`
+- **Roadmap**: `docs/roadmap/ROADMAP_FULL_IMPLEMENTATION_FROM_CURRENT_STATE.md`
+- **Roadmap (historical)**: `docs/archive/roadmap/ROADMAP.md`
 - **ADR (planner backend boundary)**: `docs/architecture/ADR_planner_backend_boundary.md`
 - **Presentation**: `docs/architecture/Super_Agent_presentation.md`
 - **Full architecture spec**: `docs/architecture/AI_Super_Agent_Architecture_Implementation_Specification.md`

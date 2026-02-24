@@ -14,7 +14,8 @@ This folder contains the documentation that is part of the open-source repositor
 
 ## Roadmap
 
-- [ROADMAP.md](roadmap/ROADMAP.md) — High-level product roadmap and stages.
+- [ROADMAP_FULL_IMPLEMENTATION_FROM_CURRENT_STATE.md](roadmap/ROADMAP_FULL_IMPLEMENTATION_FROM_CURRENT_STATE.md) — Active roadmap from current project state to full IBS implementation.
+- [archive/roadmap/ROADMAP.md](archive/roadmap/ROADMAP.md) — Historical roadmap (superseded).
 
 ---
 

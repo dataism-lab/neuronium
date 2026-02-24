@@ -8,7 +8,7 @@
 
 Связанные документы:
 - `Implementation_Binding_Spec.md` (IBS)
-- `../roadmap/ROADMAP.md`
+- `../roadmap/ROADMAP_FULL_IMPLEMENTATION_FROM_CURRENT_STATE.md`
 
 ---
 

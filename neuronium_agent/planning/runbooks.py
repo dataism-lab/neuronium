@@ -146,8 +146,7 @@ def plan_docs_report_v1(
 _DEFAULT_DOC_PATHS = [
     # Preferred new locations (docs/ structure).
     "docs/architecture/Super_Agent_presentation.md",
-    "docs/roadmap/ROADMAP.md",
-    "docs/roadmap/ROADMAP_STATUS.md",
+    "docs/roadmap/ROADMAP_FULL_IMPLEMENTATION_FROM_CURRENT_STATE.md",
     "docs/architecture/Implementation_Binding_Spec.md",
     "docs/architecture/STORAGE_SCHEMA_SPEC.md",
 ]

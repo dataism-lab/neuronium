@@ -650,3 +650,66 @@
 
 ### Handoff note
 - После push проверить статус PR checks и обновить описание PR кратким блоком про latest-wins fix + новые edge-case тесты.
+
+## 2026-02-25 — Full IBS roadmap from current state
+
+### Plan
+- Прочитать целевую IBS-спецификацию и текущее состояние migration/roadmap артефактов.
+- Зафиксировать новый отдельный roadmap-документ от текущей точки (после phase 6 + BUG-4) до полной реализации IBS.
+- Сохранить фазы с явными acceptance criteria и ближайшим стартовым шагом.
+
+### Decisions
+- Новый документ создан в `docs/roadmap/ROADMAP_FULL_IMPLEMENTATION_FROM_CURRENT_STATE.md`.
+- В roadmap зафиксированы фазы `A-F`:
+  - A: Invariants hardening (determinism/replay/immutability),
+  - B: Domain & contract completion,
+  - C: Planning/execution semantics maturity,
+  - D: Verification layer 2.0,
+  - E: Memory full stack (GraphRAG + agentic retrieval),
+  - F: CLI/runtime completion + operational readiness.
+- Для каждой фазы добавлены scope, acceptance criteria, зависимости и Definition of Done для полной IBS-готовности.
+
+### Verification
+- Подтверждено чтение и использование требований из `docs/architecture/AI_Super_Agent_Architecture_Implementation_Specification.md`.
+- Сопоставлено текущее состояние по `docs/internal/TOOL_AGNOSTIC_MIGRATION_PLAN.md`, `docs/roadmap/ROADMAP.md`, `tasks/todo.md`.
+- Новый roadmap сохранен как отдельный документ без изменения существующего roadmap-файла.
+
+### Outcome
+- Зафиксирован единый post-phase6 план от текущего состояния до полной реализации IBS с явными фазами и критериями приемки.
+
+### Handoff note
+- Следующая практическая итерация: открыть `Phase A / Iteration 1` (replay completeness checklist + red-tests на недетерминированные вызовы).
+- После старта Phase A держать изменения малыми и обратимыми, и закрывать каждый подшаг тест-доказательствами.
+
+## 2026-02-25 — Docs archive finalization and link cleanup
+
+### Plan
+- Довести частично выполненный перенос roadmap-доков в архив до консистентного состояния.
+- Обновить ссылки на активный roadmap в индексах/спеках и убрать битые пути из runbook default docs.
+- Добавить минимальный индекс архива и пометки у архивных документов.
+
+### Decisions
+- Активным roadmap зафиксирован `docs/roadmap/ROADMAP_FULL_IMPLEMENTATION_FROM_CURRENT_STATE.md`.
+- Исторические roadmap-документы оставлены в `docs/archive/roadmap/` с явной пометкой archive/superseded.
+- Выбрана общая архивная схема `docs/archive/...` вместо локального архива только внутри roadmap.
+- Обновлены ссылки:
+  - `docs/README.md` (active + historical roadmap),
+  - `README.md` (root docs links),
+  - `docs/architecture/CONFIG_SPEC.md` (related docs).
+- Обновлены runbook default doc paths:
+  - `neuronium_agent/planning/memory_runbook.py`,
+  - `neuronium_agent/planning/runbooks.py`,
+  - заменен старый `docs/roadmap/ROADMAP.md`, удален несуществующий `docs/roadmap/ROADMAP_STATUS.md`.
+- Добавлен индекс архива: `docs/archive/README.md`.
+
+### Verification
+- Подтверждено текущее состояние после пользовательского частичного переноса:
+  - `docs/roadmap/` содержит только активный roadmap,
+  - `docs/archive/roadmap/` содержит исторические roadmap-файлы.
+- Проверены и обновлены найденные ссылки на старый roadmap в docs/root/readme и runbook-файлах.
+
+### Outcome
+- Документация приведена к согласованной структуре: активные документы отдельно, архивные отдельно, без основных битых ссылок на старый roadmap.
+
+### Handoff note
+- При следующем обновлении архитектурных/плановых документов сохранять правило: активная версия в `docs/<domain>/`, предыдущая версия в `docs/archive/<domain>/` с явной пометкой superseded.

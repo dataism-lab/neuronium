@@ -41,8 +41,7 @@ from neuronium_agent.verification.memory_critic import (
 _DEFAULT_INTERNAL_DOC_PATHS: list[str] = [
     # Preferred new locations (docs/ structure).
     "docs/architecture/Super_Agent_presentation.md",
-    "docs/roadmap/ROADMAP.md",
-    "docs/roadmap/ROADMAP_STATUS.md",
+    "docs/roadmap/ROADMAP_FULL_IMPLEMENTATION_FROM_CURRENT_STATE.md",
     "docs/architecture/Implementation_Binding_Spec.md",
     "docs/architecture/STORAGE_SCHEMA_SPEC.md",
 ]

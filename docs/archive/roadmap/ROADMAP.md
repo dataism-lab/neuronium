@@ -1,5 +1,8 @@
 # ROADMAP — NEURONIUM (AI Super Agent)
 
+> Archived document (superseded).  
+> Active roadmap: `docs/roadmap/ROADMAP_FULL_IMPLEMENTATION_FROM_CURRENT_STATE.md`.
+
 Версия: v0.1  
 Дата: 2026-02-10  
 Цель: зафиксировать **последовательность реализации** (stage gates) и не забыть про GraphRAG/очереди/production-адаптеры.

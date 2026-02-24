@@ -1,5 +1,7 @@
 # Phase 6 PR9 Follow-up Note
 
+> Archived historical note (PR follow-up context).
+
 This note records follow-up fixes applied after the initial phase 6 PR review.
 
 ## Scope
