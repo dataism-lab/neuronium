@@ -29,6 +29,82 @@ if TYPE_CHECKING:
     from neuronium_agent.api import AgentRunner
 
 
+def _question_group_from_path(path: object) -> str:
+    pointer = str(path or "").strip()
+    if not pointer.startswith("/"):
+        return "root"
+    tokens = [token for token in pointer.split("/") if token]
+    if not tokens:
+        return "root"
+    if tokens[0] in {"inputs", "tool_args"}:
+        return tokens[0]
+    return "root"
+
+
+def _question_prompt_with_examples(question: dict[str, Any]) -> str:
+    key = str(question.get("key", "")).strip()
+    base = str(question.get("prompt", key)).strip() or key
+    examples = question.get("examples")
+    if not isinstance(examples, list):
+        return base
+    normalized_examples = [str(item).strip() for item in examples if str(item).strip()]
+    if not normalized_examples:
+        return base
+    return f"{base} Пример: {normalized_examples[0]}"
+
+
+def _schema_allows_type(schema: dict[str, Any], expected: str) -> bool:
+    schema_type = schema.get("type")
+    if isinstance(schema_type, str):
+        return schema_type == expected
+    if isinstance(schema_type, list):
+        return expected in schema_type
+    for key in ("anyOf", "oneOf"):
+        variants = schema.get(key)
+        if not isinstance(variants, list):
+            continue
+        for variant in variants:
+            if isinstance(variant, dict) and _schema_allows_type(variant, expected):
+                return True
+    return False
+
+
+def _parse_answer_by_question_schema(raw_answer: str, question: dict[str, Any]) -> object:
+    value = raw_answer.strip()
+    schema = question.get("expected_schema")
+    if not isinstance(schema, dict):
+        schema = {}
+
+    if _schema_allows_type(schema, "array"):
+        return [part.strip() for part in value.split(",") if part.strip()]
+
+    if _schema_allows_type(schema, "boolean"):
+        lowered = value.lower()
+        if lowered in {"true", "1", "yes", "y", "да"}:
+            return True
+        if lowered in {"false", "0", "no", "n", "нет"}:
+            return False
+
+    if _schema_allows_type(schema, "integer"):
+        try:
+            return int(value)
+        except ValueError:
+            return value
+
+    if _schema_allows_type(schema, "number"):
+        try:
+            return float(value)
+        except ValueError:
+            return value
+
+    # Backward-compatible fallback for legacy questions without schema.
+    key = str(question.get("key", "")).strip()
+    if key in {"doc_paths", "paths", "urls"}:
+        return [part.strip() for part in value.split(",") if part.strip()]
+
+    return value
+
+
 def _setup_logging(level: str = "INFO", json_logs: bool = True) -> None:
     fmt = (
         '{"ts":"%(asctime)s","level":"%(levelname)s","name":"%(name)s","msg":"%(message)s"}'
@@ -80,20 +156,21 @@ def _interactive_supervised_loop(
             }
         else:
             answers: dict[str, object] = {}
+            printed_groups: set[str] = set()
             for q in questions:
                 if not isinstance(q, dict):
                     continue
                 key = str(q.get("key", "")).strip()
                 if not key or key in answers:
                     continue
-                prompt = str(q.get("prompt", key)).strip() or key
+                group = _question_group_from_path(q.get("path"))
+                if group not in printed_groups:
+                    printed_groups.add(group)
+                    click.echo("")
+                    click.echo(f"[{group}]")
+                prompt = _question_prompt_with_examples(q)
                 answer = click.prompt(prompt, default="", show_default=False).strip()
-                if key in {"doc_paths", "paths"}:
-                    answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
-                elif key == "urls":
-                    answers[key] = [p.strip() for p in answer.split(",") if p.strip()]
-                else:
-                    answers[key] = answer
+                answers[key] = _parse_answer_by_question_schema(answer, q)
             payload = {
                 "clarification_request_artifact_id": request_artifact_id,
                 "answers": answers,
@@ -124,14 +201,20 @@ def _print_pause_help(runner: AgentRunner, trace_id: str) -> None:
         return
     click.echo("")
     click.echo("PAUSED: требуется уточнение параметров.")
-    click.echo("Вопросы:")
+    grouped: dict[str, list[dict[str, Any]]] = {}
     for q in questions:
         if not isinstance(q, dict):
             continue
-        key = str(q.get("key", "")).strip()
-        prompt = str(q.get("prompt", "")).strip()
-        if key and prompt:
-            click.echo(f"- {key}: {prompt}")
+        grouped.setdefault(_question_group_from_path(q.get("path")), []).append(q)
+
+    click.echo("Вопросы:")
+    for group in sorted(grouped):
+        click.echo(f"- Группа: {group}")
+        for q in grouped[group]:
+            key = str(q.get("key", "")).strip()
+            prompt = _question_prompt_with_examples(q)
+            if key and prompt:
+                click.echo(f"  - {key}: {prompt}")
     click.echo("")
     click.echo("Чтобы ответить интерактивно, запусти:")
     click.echo(f"  neuronium-agent run --mode supervised --trace-id {trace_id}")

@@ -27,6 +27,7 @@ class _SupervisedLoopRunnerStub:
         self._status = RunStatus(state=initial_status)
         self._pause_context = pause_context
         self.commands: list[str] = []
+        self.revise_payloads: list[dict[str, Any]] = []
 
     def get_status(self, _handle: RunHandle) -> RunStatus:
         return self._status
@@ -40,6 +41,8 @@ class _SupervisedLoopRunnerStub:
             self._status = RunStatus(state="RUNNING")
         elif command.type == "revise":
             self._status = RunStatus(state="PAUSED")
+            if isinstance(command.payload, dict):
+                self.revise_payloads.append(command.payload)
         return self._status
 
     def read_artifact_json(self, _artifact_id: str) -> dict[str, Any]:
@@ -80,6 +83,40 @@ def test_supervised_loop_sends_continue_only_for_clarification_pause(
 
     assert out_status.state == "COMPLETED"
     assert runner.commands == ["continue", "revise"]
+
+
+def test_supervised_loop_parses_array_answers_by_expected_schema(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _SupervisedLoopRunnerStub(
+        pause_context={"clarification_request_artifact_id": "aid-clarify-array"}
+    )
+    handle = _make_handle()
+
+    prompts = iter(["", "alice,bob"])  # answer_text empty -> per-question mode
+    monkeypatch.setattr(cli_main.click, "prompt", lambda *args, **kwargs: next(prompts))
+    monkeypatch.setattr(
+        runner,
+        "read_artifact_json",
+        lambda _artifact_id: {
+            "questions": [
+                {
+                    "key": "recipients",
+                    "path": "/inputs/recipients",
+                    "prompt": "Укажи получателей",
+                    "expected_schema": {"type": "array", "items": {"type": "string"}},
+                }
+            ]
+        },
+    )
+
+    _out_handle, out_status = cli_main._interactive_supervised_loop(runner, handle)
+
+    assert out_status.state == "COMPLETED"
+    assert runner.revise_payloads
+    answers = runner.revise_payloads[-1].get("answers")
+    assert isinstance(answers, dict)
+    assert answers.get("recipients") == ["alice", "bob"]
 
 
 class _InteractiveLoopRunnerStub:

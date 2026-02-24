@@ -906,6 +906,7 @@ class HtnRecursivePlannerBackend:
         )
         if not questions:
             questions = self._build_clarification_questions_fallback(missing_fields)
+        questions = self._sort_questions_for_presentation(questions)
 
         return ClarificationRequest(
             request_id=f"clarify-{request.execution_id[:10]}-{request.stage_id.replace(':', '_')}",
@@ -921,6 +922,7 @@ class HtnRecursivePlannerBackend:
                 "runbook_id": request.runbook_id,
                 "stage_id": request.stage_id,
                 "metadata_keys": sorted(effective_metadata.keys()),
+                "question_groups": self._question_group_snapshot(questions),
             },
         )
 
@@ -936,27 +938,26 @@ class HtnRecursivePlannerBackend:
             if not key:
                 continue
             reason = str(mf.reason or "").strip()
-            prompt = f"Уточни значение поля '{key}'."
-            if reason:
-                prompt += f" Причина: {reason}"
-            expected_type = "string"
-            low = key.lower()
-            if "url" in low:
-                expected_type = "url"
-            elif low.endswith("s") or "paths" in low:
-                expected_type = "string_list"
+            expected_type = cls._expected_type_for_key(key)
+            expected_schema = cls._default_schema_for_field(key)
+            prompt = cls._human_prompt_for_question(key=key, reason=reason, expected_type=expected_type)
+            examples = cls._examples_for_schema(
+                key=key,
+                expected_type=expected_type,
+                expected_schema=expected_schema,
+            )
             questions.append(
                 ClarificationQuestion(
                     key=key,
                     prompt=prompt,
                     path=cls._legacy_field_to_pointer(key),
-                    expected_schema=cls._default_schema_for_field(key),
+                    expected_schema=expected_schema,
                     expected_type=expected_type,
                     required=bool(mf.critical),
-                    examples=[],
+                    examples=examples,
                 )
             )
-        return questions
+        return cls._sort_questions_for_presentation(questions)
 
     def _build_clarification_questions_with_model(
         self,
@@ -1005,7 +1006,9 @@ class HtnRecursivePlannerBackend:
                     parameters={
                         "system_prompt": (
                             "You generate clarification questions for a user in Russian. "
-                            "Use only provided missing field keys. Return strict JSON."
+                            "Use only provided missing field keys. "
+                            "Questions must be short, human-friendly, and should not ask for raw JSON. "
+                            "Return strict JSON."
                         ),
                         "timeout_seconds": 60,
                         "max_retries": 1,
@@ -1018,6 +1021,9 @@ class HtnRecursivePlannerBackend:
         prompt = (
             "Сформулируй краткие вопросы для уточнения недостающих параметров.\n"
             "Не добавляй новые ключи, используй только перечисленные.\n\n"
+            "Сгруппируй вопросы по префиксу path, если это возможно "
+            "(например, /inputs/* и /tool_args/*).\n"
+            "Добавь 1-2 коротких примера формата ответа в поле examples.\n\n"
             f"Objective: {request.objective}\n"
             "Missing fields:\n"
             + "\n".join(
@@ -1035,6 +1041,7 @@ class HtnRecursivePlannerBackend:
         if not isinstance(raw_questions, list):
             return []
         allowed_keys = {str(mf.field) for mf in missing_fields}
+        reason_by_key = {str(mf.field): str(mf.reason or "").strip() for mf in missing_fields}
         out: list[ClarificationQuestion] = []
         for item in raw_questions:
             if not isinstance(item, dict):
@@ -1046,11 +1053,117 @@ class HtnRecursivePlannerBackend:
             normalized.setdefault("path", self._legacy_field_to_pointer(key))
             if not isinstance(normalized.get("expected_schema"), dict):
                 normalized["expected_schema"] = self._default_schema_for_field(key)
+            expected_type = str(normalized.get("expected_type", "")).strip() or self._expected_type_for_key(key)
+            normalized["expected_type"] = expected_type
+            prompt_text = str(normalized.get("prompt", "")).strip()
+            if not prompt_text:
+                normalized["prompt"] = self._human_prompt_for_question(
+                    key=key,
+                    reason=reason_by_key.get(key, ""),
+                    expected_type=expected_type,
+                )
+            raw_examples = normalized.get("examples")
+            if not isinstance(raw_examples, list) or not any(str(x).strip() for x in raw_examples):
+                normalized["examples"] = self._examples_for_schema(
+                    key=key,
+                    expected_type=expected_type,
+                    expected_schema=normalized["expected_schema"],
+                )
             try:
                 out.append(ClarificationQuestion.model_validate(normalized))
             except ValidationError:
                 continue
-        return out
+        return self._sort_questions_for_presentation(out)
+
+    @staticmethod
+    def _expected_type_for_key(key: str) -> str:
+        low = key.lower()
+        if "url" in low:
+            return "url"
+        if low.endswith("s") or "paths" in low:
+            return "string_list"
+        return "string"
+
+    @classmethod
+    def _human_prompt_for_question(
+        cls,
+        *,
+        key: str,
+        reason: str,
+        expected_type: str,
+    ) -> str:
+        if expected_type == "url":
+            prompt = f"Пришли ссылку (URL) для '{key}'."
+        elif expected_type == "string_list":
+            prompt = f"Перечисли значения для '{key}' через запятую."
+        else:
+            prompt = f"Уточни значение '{key}'."
+        if reason:
+            prompt += f" Это нужно, потому что: {reason}"
+        return prompt
+
+    @classmethod
+    def _examples_for_schema(
+        cls,
+        *,
+        key: str,
+        expected_type: str,
+        expected_schema: dict[str, Any],
+    ) -> list[str]:
+        if expected_type == "url":
+            return ["https://example.com/article"]
+        schema_type = expected_schema.get("type")
+        if schema_type == "array" or (
+            isinstance(schema_type, list)
+            and "array" in schema_type
+        ):
+            if key.endswith("_paths") or key in {"doc_paths", "paths"}:
+                return ["docs/report.md, docs/notes.md"]
+            return ["value_1, value_2"]
+        enum_values = expected_schema.get("enum")
+        if isinstance(enum_values, list):
+            values = [str(x).strip() for x in enum_values if str(x).strip()]
+            if values:
+                return values[:2]
+        if key == "output_filename":
+            return ["summary.md"]
+        return ["Короткое текстовое значение"]
+
+    @classmethod
+    def _question_group_from_path(cls, path: str | None) -> str:
+        pointer = str(path or "").strip()
+        if not pointer.startswith("/"):
+            return "/"
+        tokens = [token for token in pointer.split("/") if token]
+        if not tokens:
+            return "/"
+        if tokens[0] in {"inputs", "tool_args"}:
+            return f"/{tokens[0]}"
+        return "/"
+
+    @classmethod
+    def _sort_questions_for_presentation(
+        cls,
+        questions: list[ClarificationQuestion],
+    ) -> list[ClarificationQuestion]:
+        return sorted(
+            questions,
+            key=lambda q: (cls._question_group_from_path(q.path), q.key),
+        )
+
+    @classmethod
+    def _question_group_snapshot(
+        cls,
+        questions: list[ClarificationQuestion],
+    ) -> list[dict[str, Any]]:
+        grouped: dict[str, list[str]] = {}
+        for question in questions:
+            group = cls._question_group_from_path(question.path)
+            grouped.setdefault(group, []).append(question.key)
+        return [
+            {"group": group, "keys": sorted(set(keys))}
+            for group, keys in sorted(grouped.items())
+        ]
 
     @staticmethod
     def _persist_clarification_request_artifact(
