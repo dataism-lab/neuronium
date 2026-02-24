@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from neuronium_agent.planning.operator_catalog import OperatorCatalog
 from neuronium_agent.planning.operator_contracts import OperatorContract
-from neuronium_agent.planning.tool_schema_registry import ToolSchemaRegistry
-from neuronium_agent.planning.tool_schema_registry import extract_required_json_pointers
+from neuronium_agent.planning.tool_schema_registry import ToolSchemaRegistry as LegacyToolSchemaRegistry
+from neuronium_agent.schemas.tool_schema_registry import ToolSchemaRegistry
+from neuronium_agent.schemas.tool_schema_registry import extract_required_json_pointers
 
 
 def test_tool_schema_registry_get_schema_for_known_tool() -> None:
@@ -75,3 +76,7 @@ def test_tool_schema_registry_merge_input_schemas_union_required() -> None:
     assert merged["required"] == ["path", "payload"]
     assert sorted(merged["properties"]) == ["encoding", "out_key", "path", "payload"]
     assert merged["additionalProperties"] is False
+
+
+def test_planning_shim_exports_shared_registry() -> None:
+    assert LegacyToolSchemaRegistry is ToolSchemaRegistry
