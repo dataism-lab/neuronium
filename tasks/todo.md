@@ -98,3 +98,69 @@
 ### Handoff note
 - Next step for phase 2: connect dynamic extraction schema generation to `ToolSchemaRegistry` behind a feature flag.
 - Before phase 3 revise integration, re-check whether `ToolSchemaRegistry` should be promoted to a shared module.
+
+## 2026-02-24 — Migration plan bug-track consolidation
+
+### Plan
+- Make the phase migration document self-contained for architecture + bug context.
+- Add explicit mapping from known clarification bugs to migration phases and separate fixes.
+
+### Decisions
+- Added a dedicated `Bug Stabilization Track` section in `docs/internal/TOOL_AGNOSTIC_MIGRATION_PLAN.md`.
+- Kept bugs as a parallel track (not additional migration phases) to preserve P0/P1 prioritization.
+- Added explicit rollout gates (P0 closure, revise integrity, migration-ready criterion).
+
+### Verification
+- Verified the migration plan now includes:
+  - bug-to-phase coverage matrix,
+  - recommended execution order,
+  - rationale for parallel tracks,
+  - readiness gates.
+
+### Outcome
+- The migration plan can now be read as a single source of truth without losing critical bug context.
+
+### Handoff note
+- Before phase 2 implementation starts, confirm BUG-5 scheduling as a P0 hotfix.
+
+## 2026-02-24 — BUG-5 hotfix + phase 2 start
+
+### Plan
+- Close P0 BUG-5 in interactive CLI pause/continue flow.
+- Start phase 2 with schema-driven extraction under feature flag and legacy-safe fallback.
+- Prove changes with targeted tests before completion.
+
+### Decisions
+- BUG-5 fix in `neuronium_agent/cli/main.py`:
+  - `_interactive_supervised_loop` now checks pause type before sending `continue`;
+  - `continue` is sent only for clarification pauses with `clarification_request_artifact_id`;
+  - `_interactive_run_loop` now refreshes status from orchestrator after supervised loop.
+- Phase-2 implementation (incremental):
+  - `extraction_envelope_json_schema(...)` now supports dynamic `input_schema` injection while keeping legacy default behavior unchanged when not provided;
+  - `HtnRecursivePlannerBackend` now resolves dynamic extraction schema from `ToolSchemaRegistry` using stage `allowed_tool_names`;
+  - feature flag controls rollout:
+    - metadata: `dynamic_extraction_schema` (+ optional runbook/stage allowlists),
+    - env: `NEURONIUM_DYNAMIC_EXTRACTION_SCHEMA` (+ optional runbook/stage allowlists).
+- Backward compatibility:
+  - default path remains legacy schema (feature flag off),
+  - no forced migration in existing runbooks.
+
+### Verification
+- Added tests:
+  - `tests/test_cli_bug5_pause_flow.py`
+  - `tests/test_phase2_dynamic_extraction_schema.py`
+- Ran:
+  - `uv run pytest tests/test_cli_bug5_pause_flow.py tests/test_phase2_dynamic_extraction_schema.py tests/test_phase1_legacy_compat_smoke.py tests/test_supervised_clarification_flow.py -q`
+- Result:
+  - `9 passed`.
+- Confirmed lints for edited files:
+  - no linter errors reported.
+
+### Outcome
+- P0 BUG-5 behavior corrected: no blind `continue` for non-clarification pauses; stale status is refreshed after supervised loop.
+- Phase 2 baseline is active behind feature flag: extraction schema can be generated from tool contracts for selected runbook/stage.
+- Legacy clarification contract shape remains covered by smoke test.
+
+### Handoff note
+- Next step: expand dynamic schema integration from extraction prompt/schema into downstream validation path (phase 2 acceptance hardening).
+- Before phase 3, re-check `ToolSchemaRegistry` placement trigger if a second non-planning consumer appears in runtime paths.
