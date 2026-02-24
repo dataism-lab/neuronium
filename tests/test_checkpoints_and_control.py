@@ -887,3 +887,96 @@ class TestResumeFromCheckpoint:
         status = runner.get_status(handle)
         # Resume should succeed using _infer_runbook_id and _infer_runbook_metadata
         assert status.state == "COMPLETED"
+
+
+def test_infer_runbook_metadata_prefers_latest_clarification_context(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(tmp_dir, monkeypatch, _ITER1_PASS)
+    trace_id = "meta-infer-latest-clarification"
+
+    # Older clarification events.
+    runner._index.append_trace_event(
+        trace_id,
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "payload": {
+                "description": "Escalation requested",
+                "clarification_request_artifact_id": "req-old",
+                "evidence_artifact_ids": ["ev-old-1"],
+            },
+        },
+    )
+    runner._index.append_trace_event(
+        trace_id,
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "payload": {
+                "description": "control_command: revise",
+                "payload": {
+                    "clarification_request_artifact_id": "req-old",
+                    "clarification_response_artifact_id": "resp-old",
+                    "answers": {"url": "https://old.example"},
+                },
+            },
+        },
+    )
+
+    # Newer clarification events (must win).
+    runner._index.append_trace_event(
+        trace_id,
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "payload": {
+                "description": "Escalation requested",
+                "clarification_request_artifact_id": "req-new",
+                "evidence_artifact_ids": ["ev-new-1", "ev-new-2"],
+            },
+        },
+    )
+    runner._index.append_trace_event(
+        trace_id,
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "kind": "decision",
+            "payload": {
+                "description": "control_command: revise",
+                "payload": {
+                    "clarification_request_artifact_id": "req-new",
+                    "clarification_response_artifact_id": "resp-new",
+                    "answers": {"url": "https://new.example"},
+                },
+            },
+        },
+    )
+
+    inferred = runner._orchestrator._infer_runbook_metadata(trace_id, "super_agent_v0")
+    assert inferred.get("clarification_request_artifact_id") == "req-new"
+    assert inferred.get("clarification_response_artifact_id") == "resp-new"
+    assert inferred.get("clarification_evidence_artifact_ids") == ["ev-new-1", "ev-new-2"]
+
+
+def test_clarification_context_envelope_degrades_safely_for_missing_artifacts(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(tmp_dir, monkeypatch, _ITER1_PASS)
+    inputs = runner._orchestrator._build_clarification_context_inputs(
+        {
+            "clarification_request_artifact_id": "missing-request-aid",
+            "clarification_response_artifact_id": "missing-response-aid",
+            "clarification_evidence_artifact_ids": ["ev-1"],
+        }
+    )
+
+    assert inputs["clarification_request_artifact_id"] == "missing-request-aid"
+    assert inputs["clarification_response_artifact_id"] == "missing-response-aid"
+    assert inputs["clarification_evidence_artifact_ids"] == ["ev-1"]
+    envelope = inputs["clarification_context_envelope"]
+    assert isinstance(envelope, dict)
+    assert envelope.get("request") == {}
+    assert envelope.get("response") == {}

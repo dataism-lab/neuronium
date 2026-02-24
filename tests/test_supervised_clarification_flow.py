@@ -7,6 +7,7 @@ import pytest
 
 from neuronium_agent.api import AgentRunner
 from neuronium_agent.config import AppConfig, ProjectConfig, StorageConfig
+from neuronium_agent.nodes.base import BaseNode, NodeInput, NodeOutput
 from neuronium_agent.storage.fs_cas import FsCasStore
 from neuronium_agent.storage.sqlite_store import SqliteIndexStore
 from neuronium_agent.types import ControlCommand, RunRequest
@@ -160,6 +161,40 @@ def _make_runner(
 
     runner._orchestrator._build_node_registry = patched_build  # type: ignore[method-assign]
     return runner
+
+
+class _CaptureCriticPromptNode(BaseNode):
+    def __init__(self, node_id: str, sink: list[str]) -> None:
+        super().__init__(node_id)
+        self._sink = sink
+
+    def execute(self, node_input: NodeInput) -> NodeOutput:
+        prompt = str(node_input.inputs.get("prompt", ""))
+        self._sink.append(prompt)
+        return NodeOutput(
+            outputs={
+                "content": json.dumps({
+                    "verdict": "PASS",
+                    "confidence": 0.95,
+                    "evidence": ["captured_prompt"],
+                    "gaps": [],
+                }),
+                "captured_prompt": prompt,
+            },
+            status="COMPLETED",
+        )
+
+
+def _install_critic_prompt_capture(runner: AgentRunner, sink: list[str]) -> None:
+    original_build = runner._orchestrator._build_node_registry
+
+    def patched_build(graph, *, stage_default_model_id=None, **kwargs):
+        registry = original_build(graph, stage_default_model_id=stage_default_model_id, **kwargs)
+        if "critic_report" in registry:
+            registry["critic_report"] = _CaptureCriticPromptNode("critic_report", sink)
+        return registry
+
+    runner._orchestrator._build_node_registry = patched_build  # type: ignore[method-assign]
 
 
 def test_supervised_clarification_pause_revise_resume_flow(
@@ -536,3 +571,106 @@ def test_supervised_clarification_revise_answer_text_respects_configurable_thres
     conversion = control_payload.get("nl_patch_conversion")
     assert isinstance(conversion, dict)
     assert conversion.get("status") == "needs_clarification"
+
+
+def test_supervised_critic_prompt_contains_clarification_context_envelope(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(tmp_dir, monkeypatch)
+    captured_prompts: list[str] = []
+    _install_critic_prompt_capture(runner, captured_prompts)
+
+    handle = runner.start(RunRequest(
+        objective="Сделай сводку новости",
+        mode="supervised",
+        metadata={"runbook_id": "super_agent_v0"},
+    ))
+    assert runner.get_status(handle).state == "PAUSED"
+    pause_context = runner.get_latest_pause_context(handle.trace_id)
+    assert pause_context is not None
+    request_artifact_id = str(
+        pause_context.get("clarification_request_artifact_id", "")
+    ).strip()
+    assert request_artifact_id
+
+    revise_status = runner.control(
+        handle,
+        ControlCommand(
+            type="revise",
+            payload={
+                "clarification_request_artifact_id": request_artifact_id,
+                "answers": {"url": "https://example.com/news/1"},
+            },
+        ),
+    )
+    assert revise_status.state == "PAUSED"
+    assert runner.control(handle, ControlCommand(type="continue", payload={})).state == "RUNNING"
+    final_status = runner.get_status(runner.resume_run(handle.trace_id))
+    assert final_status.state == "COMPLETED"
+
+    events = list(runner._index.get_trace_events(handle.trace_id))
+    revise_events = [
+        e for e in events
+        if e["kind"] == "decision"
+        and e.get("payload", {}).get("description") == "control_command: revise"
+    ]
+    assert revise_events
+    control_payload = revise_events[-1]["payload"]["payload"]
+    response_artifact_id = str(
+        control_payload.get("clarification_response_artifact_id", "")
+    ).strip()
+    assert response_artifact_id
+
+    assert captured_prompts
+    prompt = captured_prompts[-1]
+    assert "clarification_request_artifact_id" in prompt
+    assert request_artifact_id in prompt
+    assert "clarification_response_artifact_id" in prompt
+    assert response_artifact_id in prompt
+    assert "clarification_context_envelope" in prompt
+    assert "evidence_artifact_ids" in prompt
+
+
+def test_supervised_critic_clarification_envelope_replay_is_deterministic(
+    tmp_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _make_runner(tmp_dir, monkeypatch)
+    captured_prompts: list[str] = []
+    _install_critic_prompt_capture(runner, captured_prompts)
+
+    handle = runner.start(RunRequest(
+        objective="Сделай сводку новости",
+        mode="supervised",
+        metadata={"runbook_id": "super_agent_v0"},
+    ))
+    assert runner.get_status(handle).state == "PAUSED"
+    pause_context = runner.get_latest_pause_context(handle.trace_id)
+    assert pause_context is not None
+    request_artifact_id = str(
+        pause_context.get("clarification_request_artifact_id", "")
+    ).strip()
+    assert request_artifact_id
+
+    runner.control(
+        handle,
+        ControlCommand(
+            type="revise",
+            payload={
+                "clarification_request_artifact_id": request_artifact_id,
+                "answers": {"url": "https://example.com/news/1"},
+            },
+        ),
+    )
+    assert runner.control(handle, ControlCommand(type="continue", payload={})).state == "RUNNING"
+    assert runner.get_status(runner.resume_run(handle.trace_id)).state == "COMPLETED"
+    assert captured_prompts
+    live_prompt = captured_prompts[-1]
+
+    replay_handle = runner.replay(handle.trace_id)
+    replay_status = runner.get_status(replay_handle)
+    assert replay_status.state == "COMPLETED"
+    assert len(captured_prompts) >= 2
+    replay_prompt = captured_prompts[-1]
+    assert replay_prompt == live_prompt

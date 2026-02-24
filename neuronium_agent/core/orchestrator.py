@@ -883,12 +883,17 @@ class Orchestrator:
                 failure_history_in_stage: list[list[str]] = []
                 verdict_fix_attempts = 0
                 stage_verdict_fix_override: dict[str, Any] | None = None
+                clarification_context_inputs = self._build_clarification_context_inputs(
+                    metadata
+                )
                 while True:
                     if not skip_execute:
                         state.intention.phase = IntentionPhase.EXECUTE  # type: ignore[union-attr]
                         execute_inputs = (stage.initial_inputs_override or {}) | (
                             graph_builder_initial_inputs or {}
-                        ) | (stage_verdict_fix_override or {})
+                        ) | clarification_context_inputs | (
+                            stage_verdict_fix_override or {}
+                        )
                         initial_node_results: dict[str, NodeOutput] | None = None
                         if (
                             resume_ctx
@@ -1508,6 +1513,9 @@ class Orchestrator:
     ) -> dict[str, Any]:
         """Best-effort: reconstruct metadata dict from trace events for replay."""
         metadata: dict[str, Any] = {"runbook_id": runbook_id}
+        seen_clarification_request = False
+        seen_clarification_response = False
+        seen_clarification_evidence = False
         try:
             events = list(self.index_store.get_trace_events(trace_id))
         except Exception:
@@ -1528,10 +1536,12 @@ class Orchestrator:
                     resp_aid = str(
                         control_payload.get("clarification_response_artifact_id", "")
                     ).strip()
-                    if req_aid:
+                    if req_aid and not seen_clarification_request:
                         metadata["clarification_request_artifact_id"] = req_aid
-                    if resp_aid:
+                        seen_clarification_request = True
+                    if resp_aid and not seen_clarification_response:
                         metadata["clarification_response_artifact_id"] = resp_aid
+                        seen_clarification_response = True
 
                     patch_ops = self._normalise_patch_ops(control_payload.get("patch"))
                     if not patch_ops:
@@ -1546,6 +1556,17 @@ class Orchestrator:
                                 "Skipping invalid revise patch during metadata inference: %s",
                                 exc,
                             )
+            if description == "Escalation requested":
+                req_aid = str(payload.get("clarification_request_artifact_id", "")).strip()
+                if req_aid and not seen_clarification_request:
+                    metadata["clarification_request_artifact_id"] = req_aid
+                    seen_clarification_request = True
+                evidence_ids = payload.get("evidence_artifact_ids", [])
+                if isinstance(evidence_ids, list) and not seen_clarification_evidence:
+                    metadata["clarification_evidence_artifact_ids"] = [
+                        str(aid) for aid in evidence_ids if str(aid).strip()
+                    ]
+                    seen_clarification_evidence = True
             # Pick up doc_paths for docs_report_v1
             if (
                 payload.get("runbook_id") == runbook_id
@@ -1560,6 +1581,47 @@ class Orchestrator:
                 metadata["doc_paths"] = [str(p) for p in payload["doc_paths"]]
                 continue
         return metadata
+
+    def _build_clarification_context_inputs(
+        self, metadata: dict[str, Any]
+    ) -> dict[str, Any]:
+        request_artifact_id = str(
+            metadata.get("clarification_request_artifact_id", "")
+        ).strip()
+        response_artifact_id = str(
+            metadata.get("clarification_response_artifact_id", "")
+        ).strip()
+        raw_evidence_ids = metadata.get("clarification_evidence_artifact_ids", [])
+        evidence_artifact_ids: list[str] = []
+        if isinstance(raw_evidence_ids, list):
+            evidence_artifact_ids = [
+                str(aid).strip() for aid in raw_evidence_ids if str(aid).strip()
+            ]
+        if not request_artifact_id and not response_artifact_id and not evidence_artifact_ids:
+            return {}
+
+        envelope: dict[str, Any] = {
+            "version": "bug4.v1",
+            "request_artifact_id": request_artifact_id,
+            "response_artifact_id": response_artifact_id,
+            "evidence_artifact_ids": evidence_artifact_ids,
+            "request": (
+                self._load_artifact_json_or_empty(request_artifact_id)
+                if request_artifact_id
+                else {}
+            ),
+            "response": (
+                self._load_artifact_json_or_empty(response_artifact_id)
+                if response_artifact_id
+                else {}
+            ),
+        }
+        return {
+            "clarification_request_artifact_id": request_artifact_id,
+            "clarification_response_artifact_id": response_artifact_id,
+            "clarification_evidence_artifact_ids": evidence_artifact_ids,
+            "clarification_context_envelope": envelope,
+        }
 
     @staticmethod
     def _normalise_patch_ops(raw_patch: Any) -> list[dict[str, Any]]:
